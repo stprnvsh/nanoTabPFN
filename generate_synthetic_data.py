@@ -47,18 +47,22 @@ def generate_synthetic_h5(output_path: str, num_samples: int, max_seq: int = 150
             end = min(start + batch_size, num_samples)
             n = end - start
             
-            # Random features (normalized-ish, like real tabular data)
+            # Random features: standard normal N(0,1) like original
             X_batch = np.random.randn(n, max_seq, num_features).astype(np.float32)
             
             # Random binary/multiclass labels
             y_batch = np.random.randint(0, num_classes, size=(n, max_seq)).astype(np.float32)
             
-            # Random train/test split positions (between 50-100 train samples)
-            split_pos = np.random.randint(50, 100, size=n).astype(np.int32)
+            # Train/test split: 10%-90% of sequence (matches original 15-134 for 150 rows)
+            min_split = max(1, int(0.1 * max_seq))
+            max_split = int(0.9 * max_seq)
+            split_pos = np.random.randint(min_split, max_split, size=n).astype(np.int32)
             
-            # All samples use full sequence and features
+            # Varying number of features (1 to num_features) like original
+            nf = np.random.randint(1, num_features + 1, size=n).astype(np.int32)
+            
+            # All samples use full sequence length
             ndp = np.full(n, max_seq, dtype=np.int32)
-            nf = np.full(n, num_features, dtype=np.int32)
             
             X[start:end] = X_batch
             y[start:end] = y_batch
@@ -74,12 +78,16 @@ def generate_synthetic_h5(output_path: str, num_samples: int, max_seq: int = 150
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scale", type=int, default=10, help="Scale factor vs original (300k)")
+    parser.add_argument("--scale", type=int, default=10, help="Scale factor for num_samples (300k base)")
+    parser.add_argument("--samples", type=int, default=None, help="Override: exact number of samples")
+    parser.add_argument("--rows", type=int, default=150, help="Rows per sample (default 150)")
+    parser.add_argument("--features", type=int, default=5, help="Features per sample (default 5)")
+    parser.add_argument("--classes", type=int, default=2, help="Number of classes (default 2)")
     parser.add_argument("--output", type=str, default=None, help="Output path")
     args = parser.parse_args()
     
-    num_samples = 300_000 * args.scale
-    output = args.output or f"{num_samples // 1000}k_150x5_2.h5"
+    num_samples = args.samples if args.samples else 300_000 * args.scale
+    output = args.output or f"{num_samples // 1000}k_{args.rows}x{args.features}_{args.classes}.h5"
     
-    generate_synthetic_h5(output, num_samples)
+    generate_synthetic_h5(output, num_samples, max_seq=args.rows, num_features=args.features, num_classes=args.classes)
 
