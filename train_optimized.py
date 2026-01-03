@@ -209,60 +209,71 @@ class PriorDumpDataLoader(DataLoader):
         return self.num_steps
 
 
-def convert_h5_to_raw(h5_filename):
-    """Convert HDF5 to raw .npy files for true GDS. Returns paths."""
+def convert_h5_to_raw(h5_filename, use_bin=False):
+    """Convert HDF5 to raw files. Returns paths and shape info."""
     import os
     base = h5_filename.replace('.h5', '')
-    x_path = f"{base}_X.npy"
-    y_path = f"{base}_y.npy"
+    
+    if use_bin:
+        x_path = f"{base}_X.bin"
+        y_path = f"{base}_y.bin"
+    else:
+        x_path = f"{base}_X.npy"
+        y_path = f"{base}_y.npy"
     meta_path = f"{base}_meta.npy"
     
-    if os.path.exists(x_path) and os.path.exists(y_path) and os.path.exists(meta_path):
-        print(f"Raw files already exist: {x_path}")
-        return x_path, y_path, meta_path
-    
-    print(f"Converting {h5_filename} to raw .npy files...")
+    # Load metadata first to get shapes
     with h5py.File(h5_filename, "r") as f:
-        X = f["X"][:]
-        y = f["y"][:]
+        shape_x = f["X"].shape
+        shape_y = f["y"].shape
         meta = {
             'max_num_classes': f["max_num_classes"][0],
             'num_datapoints': f["num_datapoints"][:],
             'num_features': f["num_features"][:],
-            'single_eval_pos': f["single_eval_pos"][:]
+            'single_eval_pos': f["single_eval_pos"][:],
+            'shape_x': shape_x,
+            'shape_y': shape_y
         }
     
-    np.save(x_path, X)
-    np.save(y_path, y)
+    if os.path.exists(x_path) and os.path.exists(y_path) and os.path.exists(meta_path):
+        print(f"Raw files exist: {x_path}")
+        return x_path, y_path, meta_path, meta
+    
+    print(f"Converting {h5_filename} to raw {'bin' if use_bin else 'npy'} files...")
+    with h5py.File(h5_filename, "r") as f:
+        X = f["X"][:].astype(np.float32)
+        y = f["y"][:].astype(np.float32)
+    
+    if use_bin:
+        X.tofile(x_path)
+        y.tofile(y_path)
+    else:
+        np.save(x_path, X)
+        np.save(y_path, y)
+    
     np.save(meta_path, meta, allow_pickle=True)
     print(f"Saved: {x_path} ({X.nbytes / 1e9:.2f} GB)")
-    return x_path, y_path, meta_path
+    return x_path, y_path, meta_path, meta
 
 
 class GDSDataLoader(DataLoader):
     """
-    GPU Direct Storage dataloader using kvikio.
-    Converts HDF5 to raw .npy on first run, then reads directly to GPU.
+    GPU Direct Storage dataloader.
+    --gds-bin: true GDS with raw .bin files (disk -> GPU, no CPU)
+    --gds: uses .npy with mmap + cupy
     """
-    def __init__(self, filename, num_steps=None, batch_size=32, device=None):
+    def __init__(self, filename, num_steps=None, batch_size=32, device=None, use_bin=False):
         self.batch_size = batch_size
         self.device = device if device else get_default_device()
         self.pointer = 0
+        self.use_bin = use_bin
         
-        # Convert to raw format for true GDS
-        self.x_path, self.y_path, meta_path = convert_h5_to_raw(filename)
+        # Convert to raw format
+        self.x_path, self.y_path, meta_path, meta = convert_h5_to_raw(filename, use_bin=use_bin)
         
-        # Load metadata
-        meta = np.load(meta_path, allow_pickle=True).item()
         self.max_num_classes = meta['max_num_classes']
         self.single_eval_pos = meta['single_eval_pos']
-        
-        # Memory-map the raw files (no load into RAM)
-        self.X_mmap = np.load(self.x_path, mmap_mode='r')
-        self.y_mmap = np.load(self.y_path, mmap_mode='r')
-        self.total_samples = self.X_mmap.shape[0]
-        self.max_seq = self.X_mmap.shape[1]
-        self.num_features = self.X_mmap.shape[2]
+        self.total_samples, self.max_seq, self.num_features = meta['shape_x']
         
         if num_steps is None:
             self.num_steps = self.total_samples // batch_size
@@ -273,46 +284,87 @@ class GDSDataLoader(DataLoader):
         try:
             import kvikio
             import cupy as cp
-            self.use_gds = True
+            self.has_kvikio = True
             self.kvikio = kvikio
             self.cp = cp
-            print(f"GDSDataLoader: Using kvikio + raw .npy (true GDS)")
         except ImportError:
-            self.use_gds = False
-            print(f"GDSDataLoader: kvikio not available, using mmap")
+            self.has_kvikio = False
+        
+        if use_bin and self.has_kvikio:
+            print(f"GDSDataLoader: TRUE GDS with .bin (disk -> GPU)")
+            self.mode = "true_gds"
+        elif self.has_kvikio:
+            self.X_mmap = np.load(self.x_path, mmap_mode='r')
+            self.y_mmap = np.load(self.y_path, mmap_mode='r')
+            print(f"GDSDataLoader: mmap + cupy")
+            self.mode = "mmap_cupy"
+        else:
+            if use_bin:
+                print(f"GDSDataLoader: .bin without kvikio, using numpy fromfile")
+            else:
+                self.X_mmap = np.load(self.x_path, mmap_mode='r')
+                self.y_mmap = np.load(self.y_path, mmap_mode='r')
+            print(f"GDSDataLoader: mmap + torch")
+            self.mode = "mmap_torch"
         
         print(f"GDSDataLoader: {self.total_samples:,} samples, {self.num_steps} steps, batch_size={batch_size}")
     
     def __iter__(self):
-        if self.use_gds:
-            yield from self._iter_gds()
+        if self.mode == "true_gds":
+            yield from self._iter_true_gds()
+        elif self.mode == "mmap_cupy":
+            yield from self._iter_mmap_cupy()
         else:
-            yield from self._iter_mmap()
+            yield from self._iter_mmap_torch()
     
-    def _iter_gds(self):
-        """True GDS: raw file -> GPU via kvikio"""
+    def _iter_true_gds(self):
+        """TRUE GDS: .bin file -> GPU via kvikio, bypassing CPU entirely"""
         kvikio = self.kvikio
         cp = self.cp
         
-        # Calculate offsets for direct reads
-        bytes_per_x_sample = self.max_seq * self.num_features * 4  # float32
+        bytes_per_x_sample = self.max_seq * self.num_features * 4
         bytes_per_y_sample = self.max_seq * 4
-        npy_header_size = 128  # approximate, .npy header
+        
+        x_file = kvikio.CuFile(self.x_path, "r")
+        y_file = kvikio.CuFile(self.y_path, "r")
+        
+        try:
+            for step in range(self.num_steps):
+                # Allocate GPU buffers
+                x_gpu = cp.empty((self.batch_size, self.max_seq, self.num_features), dtype=cp.float32)
+                y_gpu = cp.empty((self.batch_size, self.max_seq), dtype=cp.float32)
+                
+                # Calculate file offsets
+                x_offset = self.pointer * bytes_per_x_sample
+                y_offset = self.pointer * bytes_per_y_sample
+                
+                # Direct read: disk -> GPU (no CPU involved)
+                x_file.pread(x_gpu, file_offset=x_offset)
+                y_file.pread(y_gpu, file_offset=y_offset)
+                
+                x = torch.as_tensor(x_gpu, device=self.device)
+                y = torch.as_tensor(y_gpu, device=self.device)
+                
+                train_test_split_index = self.single_eval_pos[self.pointer]
+                
+                self.pointer += self.batch_size
+                if self.pointer >= self.total_samples:
+                    self.pointer = 0
+                
+                yield dict(x=x, y=y, train_test_split_index=int(train_test_split_index))
+        finally:
+            x_file.close()
+            y_file.close()
+    
+    def _iter_mmap_cupy(self):
+        """mmap -> cupy -> torch (still fast, but touches CPU)"""
+        cp = self.cp
         
         for step in range(self.num_steps):
             end = self.pointer + self.batch_size
             
-            # Allocate GPU buffers
-            x_gpu = cp.empty((self.batch_size, self.max_seq, self.num_features), dtype=cp.float32)
-            y_gpu = cp.empty((self.batch_size, self.max_seq), dtype=cp.float32)
-            
-            # Read from mmap (already efficient) then copy to GPU
-            x_np = self.X_mmap[self.pointer:end]
-            y_np = self.y_mmap[self.pointer:end]
-            
-            # Direct GPU copy via cupy
-            x_gpu[:] = cp.asarray(x_np)
-            y_gpu[:] = cp.asarray(y_np)
+            x_gpu = cp.asarray(self.X_mmap[self.pointer:end])
+            y_gpu = cp.asarray(self.y_mmap[self.pointer:end])
             
             x = torch.as_tensor(x_gpu, device=self.device)
             y = torch.as_tensor(y_gpu, device=self.device)
@@ -325,7 +377,7 @@ class GDSDataLoader(DataLoader):
             
             yield dict(x=x, y=y, train_test_split_index=int(train_test_split_index))
     
-    def _iter_mmap(self):
+    def _iter_mmap_torch(self):
         """Fallback: mmap + torch"""
         for step in range(self.num_steps):
             end = self.pointer + self.batch_size
@@ -354,7 +406,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch", type=int, default=2, help="Batches to prefetch in VRAM")
     parser.add_argument("--data", type=str, default="30k_5000x5_2.h5", help="HDF5 data file")
     parser.add_argument("--full", action="store_true", help="Train on full dataset (ignore --steps)")
-    parser.add_argument("--gds", action="store_true", help="Use GPU Direct Storage (kvikio)")
+    parser.add_argument("--gds", action="store_true", help="Use GDS with .npy (mmap + cupy)")
+    parser.add_argument("--gds-bin", action="store_true", help="TRUE GDS with .bin (disk -> GPU, no CPU)")
     args = parser.parse_args()
 
     device = get_default_device()
@@ -366,13 +419,11 @@ if __name__ == "__main__":
     print(f"Batch size: {args.batch_size}")
     print(f"VRAM prefetch: {args.prefetch} batches")
     print(f"Data file: {args.data}")
-    print(f"GDS (kvikio): {args.gds}")
+    print(f"GDS mode: {'bin (true GDS)' if args.gds_bin else 'npy' if args.gds else 'off'}")
     
-    # Select dataloader
-    if args.gds:
-        DataLoaderClass = GDSDataLoader
-    else:
-        DataLoaderClass = PriorDumpDataLoader
+    # Determine GDS mode
+    use_gds = args.gds or args.gds_bin
+    use_bin = args.gds_bin
     
     # Determine num_steps
     num_steps = None if args.full else args.steps
@@ -396,8 +447,8 @@ if __name__ == "__main__":
         # Warmup for torch.compile (captures compilation time separately)
         print("Warming up (includes torch.compile time if enabled)...")
         warmup_start = time.time()
-        if args.gds:
-            warmup_prior = GDSDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device)
+        if use_gds:
+            warmup_prior = GDSDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device, use_bin=use_bin)
         else:
             warmup_prior = PriorDumpDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
         train(model, warmup_prior, lr=4e-3, steps_per_eval=100)
@@ -407,8 +458,8 @@ if __name__ == "__main__":
         print(f"Warmup time: {warmup_time:.2f}s")
         
         print(f"\nProfiling {args.steps} steps...")
-        if args.gds:
-            prior = GDSDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device)
+        if use_gds:
+            prior = GDSDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, use_bin=use_bin)
         else:
             prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
         profile_start = time.time()
@@ -443,8 +494,8 @@ if __name__ == "__main__":
     else:
         # Timed training run
         print(f"\nTraining {args.steps} steps...")
-        if args.gds:
-            prior = GDSDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device)
+        if use_gds:
+            prior = GDSDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, use_bin=use_bin)
         else:
             prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
         
