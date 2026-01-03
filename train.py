@@ -171,7 +171,16 @@ class PriorDumpDataLoader(DataLoader):
         return self.num_steps
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", action="store_true", help="Run with PyTorch profiler")
+    parser.add_argument("--steps", type=int, default=100, help="Training steps")
+    args = parser.parse_args()
+
     device = get_default_device()
+    print(f"Device: {device}")
+    print(f"Steps: {args.steps}")
+    
     model = NanoTabPFNModel(
         embedding_size=96,
         num_attention_heads=4,
@@ -179,7 +188,51 @@ if __name__ == "__main__":
         num_layers=3,
         num_outputs=2
     )
-    prior = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=2500, batch_size=32, device=device)
-    model, history = train(model, prior, lr=4e-3, steps_per_eval=25)
-    print("Final evaluation:")
-    print(eval(NanoTabPFNClassifier(model, device)))
+
+    if args.profile:
+        from torch.profiler import profile, ProfilerActivity
+        prior = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=args.steps, batch_size=32, device=device)
+        
+        start = time.time()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+        ) as prof:
+            model, history = train(model, prior, lr=4e-3, steps_per_eval=args.steps + 1)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        total_time = time.time() - start
+        
+        print(f"\n=== TIMING ===")
+        print(f"Total time: {total_time:.2f}s")
+        print(f"Steps/sec: {args.steps / total_time:.1f}")
+        print(f"ms/step: {1000 * total_time / args.steps:.2f}")
+        
+        print("\n=== TOP CUDA OPERATIONS ===")
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=15))
+        print("\n=== TOP CPU OPERATIONS ===")
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=15))
+        print("\n=== MEMORY TRANSFERS (aten::to, aten::copy_) ===")
+        for evt in prof.key_averages():
+            if any(x in evt.key for x in ["aten::to", "aten::copy_", "cudaMemcpy", "aten::_to_copy"]):
+                cuda_t = getattr(evt, 'self_cuda_time_total', 0) or 0
+                print(f"{evt.key:50} CPU:{evt.cpu_time_total/1e3:8.2f}ms  CUDA:{cuda_t/1e3:8.2f}ms  Calls:{evt.count}")
+        print("\n=== CUDA MEMORY SUMMARY ===")
+        if device == "cuda":
+            print(torch.cuda.memory_summary())
+    else:
+        prior = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=args.steps, batch_size=32, device=device)
+        start = time.time()
+        model, history = train(model, prior, lr=4e-3, steps_per_eval=25)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        total_time = time.time() - start
+        
+        print(f"\n=== TIMING ===")
+        print(f"Total time: {total_time:.2f}s")
+        print(f"Steps/sec: {args.steps / total_time:.1f}")
+        print(f"ms/step: {1000 * total_time / args.steps:.2f}")
+        
+        print("\nFinal evaluation:")
+        print(eval(NanoTabPFNClassifier(model, device)))
