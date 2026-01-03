@@ -78,7 +78,7 @@ def generate_synthetic_h5(output_path: str, num_samples: int, max_seq: int = 150
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scale", type=int, default=10, help="Scale factor for num_samples (300k base)")
+    parser.add_argument("--scale", type=float, default=1.0, help="Scale factor for num_samples (300k base)")
     parser.add_argument("--samples", type=int, default=None, help="Override: exact number of samples")
     parser.add_argument("--rows", type=int, default=150, help="Rows per sample (default 150)")
     parser.add_argument("--features", type=int, default=5, help="Features per sample (default 5)")
@@ -86,7 +86,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default=None, help="Output path")
     args = parser.parse_args()
     
-    num_samples = args.samples if args.samples else 300_000 * args.scale
+    num_samples = args.samples if args.samples else int(300_000 * args.scale)
     output = args.output or f"{num_samples // 1000}k_{args.rows}x{args.features}_{args.classes}.h5"
     
     generate_synthetic_h5(output, num_samples, max_seq=args.rows, num_features=args.features, num_classes=args.classes)
