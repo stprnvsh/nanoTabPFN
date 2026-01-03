@@ -15,6 +15,7 @@ import numpy as np
 import schedulefree
 import torch
 from model import NanoTabPFNClassifier, NanoTabPFNModel
+from model_optimized import NanoTabPFNModelOptimized, NanoTabPFNClassifier as NanoTabPFNClassifierOptimized
 from sklearn.datasets import load_breast_cancer
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -408,6 +409,7 @@ if __name__ == "__main__":
     parser.add_argument("--full", action="store_true", help="Train on full dataset (ignore --steps)")
     parser.add_argument("--gds", action="store_true", help="Use GDS with .npy (mmap + cupy)")
     parser.add_argument("--gds-bin", action="store_true", help="TRUE GDS with .bin (disk -> GPU, no CPU)")
+    parser.add_argument("--flash", action="store_true", help="Use Flash Attention model (O(n) memory)")
     args = parser.parse_args()
 
     device = get_default_device()
@@ -420,6 +422,7 @@ if __name__ == "__main__":
     print(f"VRAM prefetch: {args.prefetch} batches")
     print(f"Data file: {args.data}")
     print(f"GDS mode: {'bin (true GDS)' if args.gds_bin else 'npy' if args.gds else 'off'}")
+    print(f"Flash Attention: {args.flash}")
     
     # Determine GDS mode
     use_gds = args.gds or args.gds_bin
@@ -428,13 +431,23 @@ if __name__ == "__main__":
     # Determine num_steps
     num_steps = None if args.full else args.steps
     
-    model = NanoTabPFNModel(
-        embedding_size=96,
-        num_attention_heads=4,
-        mlp_hidden_size=192,
-        num_layers=3,
-        num_outputs=2
-    )
+    # Select model
+    if args.flash:
+        model = NanoTabPFNModelOptimized(
+            embedding_size=96,
+            num_attention_heads=4,
+            mlp_hidden_size=192,
+            num_layers=3,
+            num_outputs=2
+        )
+    else:
+        model = NanoTabPFNModel(
+            embedding_size=96,
+            num_attention_heads=4,
+            mlp_hidden_size=192,
+            num_layers=3,
+            num_outputs=2
+        )
     
     # Compile once here, not inside train()
     if not args.no_compile and device == "cuda":
