@@ -58,15 +58,10 @@ def eval(classifier):
 
 
 def train(model: NanoTabPFNModel, prior: DataLoader,
-          lr: float = 1e-4, device: torch.device = None, steps_per_eval=10, eval_func=None,
-          use_compile=True):
+          lr: float = 1e-4, device: torch.device = None, steps_per_eval=10, eval_func=None):
     if not device:
         device = get_default_device()
     model.to(device)
-    
-    # Compile model to fuse kernels (reduces 18k launches to ~hundreds)
-    if use_compile and device == "cuda":
-        model = torch.compile(model, mode="reduce-overhead")
     
     optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=lr, weight_decay=0.0)
     criterion = nn.CrossEntropyLoss()
@@ -333,7 +328,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=64, help="Larger batch = better GPU util")
     parser.add_argument("--steps", type=int, default=100, help="Training steps for timing")
     parser.add_argument("--prefetch", type=int, default=2, help="Batches to prefetch in VRAM")
-    parser.add_argument("--data", type=str, default="300k_150x5_2.h5", help="HDF5 data file")
+    parser.add_argument("--data", type=str, default="30k_5000x5_2.h5", help="HDF5 data file")
     parser.add_argument("--full", action="store_true", help="Train on full dataset (ignore --steps)")
     parser.add_argument("--gds", action="store_true", help="Use GPU Direct Storage (kvikio)")
     args = parser.parse_args()
@@ -365,6 +360,11 @@ if __name__ == "__main__":
         num_layers=3,
         num_outputs=2
     )
+    
+    # Compile once here, not inside train()
+    if not args.no_compile and device == "cuda":
+        print("Compiling model...")
+        model = torch.compile(model)
 
     if args.profile:
         from torch.profiler import profile, ProfilerActivity
@@ -376,7 +376,7 @@ if __name__ == "__main__":
             warmup_prior = GDSDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device)
         else:
             warmup_prior = PriorDumpDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
-        train(model, warmup_prior, lr=4e-3, steps_per_eval=100, use_compile=not args.no_compile)
+        train(model, warmup_prior, lr=4e-3, steps_per_eval=100)
         if device == "cuda":
             torch.cuda.synchronize()
         warmup_time = time.time() - warmup_start
@@ -393,7 +393,7 @@ if __name__ == "__main__":
             record_shapes=True,
             profile_memory=True,
         ) as prof:
-            train(model, prior, lr=4e-3, steps_per_eval=args.steps + 1, use_compile=False)  # Already compiled
+            train(model, prior, lr=4e-3, steps_per_eval=args.steps + 1)
         if device == "cuda":
             torch.cuda.synchronize()
         profile_time = time.time() - profile_start
@@ -425,7 +425,7 @@ if __name__ == "__main__":
             prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
         
         start = time.time()
-        model, history = train(model, prior, lr=4e-3, steps_per_eval=25, use_compile=not args.no_compile)
+        model, history = train(model, prior, lr=4e-3, steps_per_eval=25)
         if device == "cuda":
             torch.cuda.synchronize()
         total_time = time.time() - start
