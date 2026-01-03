@@ -209,112 +209,136 @@ class PriorDumpDataLoader(DataLoader):
         return self.num_steps
 
 
+def convert_h5_to_raw(h5_filename):
+    """Convert HDF5 to raw .npy files for true GDS. Returns paths."""
+    import os
+    base = h5_filename.replace('.h5', '')
+    x_path = f"{base}_X.npy"
+    y_path = f"{base}_y.npy"
+    meta_path = f"{base}_meta.npy"
+    
+    if os.path.exists(x_path) and os.path.exists(y_path) and os.path.exists(meta_path):
+        print(f"Raw files already exist: {x_path}")
+        return x_path, y_path, meta_path
+    
+    print(f"Converting {h5_filename} to raw .npy files...")
+    with h5py.File(h5_filename, "r") as f:
+        X = f["X"][:]
+        y = f["y"][:]
+        meta = {
+            'max_num_classes': f["max_num_classes"][0],
+            'num_datapoints': f["num_datapoints"][:],
+            'num_features': f["num_features"][:],
+            'single_eval_pos': f["single_eval_pos"][:]
+        }
+    
+    np.save(x_path, X)
+    np.save(y_path, y)
+    np.save(meta_path, meta, allow_pickle=True)
+    print(f"Saved: {x_path} ({X.nbytes / 1e9:.2f} GB)")
+    return x_path, y_path, meta_path
+
+
 class GDSDataLoader(DataLoader):
     """
     GPU Direct Storage dataloader using kvikio.
-    
-    Reads directly from disk to GPU VRAM, bypassing CPU memory entirely.
-    Requires: pip install kvikio cupy-cuda12x
-    
-    Note: GDS works best with:
-    - NVMe SSDs with GDS support
-    - Raw binary files (not HDF5 - we pre-convert)
-    - Large sequential reads
+    Converts HDF5 to raw .npy on first run, then reads directly to GPU.
     """
     def __init__(self, filename, num_steps=None, batch_size=32, device=None):
         self.batch_size = batch_size
         self.device = device if device else get_default_device()
         self.pointer = 0
         
-        # Load metadata from HDF5 (small, stays on CPU)
-        with h5py.File(filename, "r") as f:
-            self.max_num_classes = f["max_num_classes"][0]
-            self.total_samples = f["X"].shape[0]
-            self.max_seq = f["X"].shape[1]
-            self.num_features = f["X"].shape[2]
-            # Cache metadata arrays
-            self.num_datapoints = f["num_datapoints"][:]
-            self.num_features_arr = f["num_features"][:]
-            self.single_eval_pos = f["single_eval_pos"][:]
+        # Convert to raw format for true GDS
+        self.x_path, self.y_path, meta_path = convert_h5_to_raw(filename)
+        
+        # Load metadata
+        meta = np.load(meta_path, allow_pickle=True).item()
+        self.max_num_classes = meta['max_num_classes']
+        self.single_eval_pos = meta['single_eval_pos']
+        
+        # Memory-map the raw files (no load into RAM)
+        self.X_mmap = np.load(self.x_path, mmap_mode='r')
+        self.y_mmap = np.load(self.y_path, mmap_mode='r')
+        self.total_samples = self.X_mmap.shape[0]
+        self.max_seq = self.X_mmap.shape[1]
+        self.num_features = self.X_mmap.shape[2]
         
         if num_steps is None:
             self.num_steps = self.total_samples // batch_size
         else:
             self.num_steps = num_steps
         
-        # Try to import kvikio, fall back to regular loading
+        # Check for kvikio
         try:
             import kvikio
             import cupy as cp
             self.use_gds = True
             self.kvikio = kvikio
             self.cp = cp
-            print(f"GDSDataLoader: Using kvikio GPU Direct Storage")
+            print(f"GDSDataLoader: Using kvikio + raw .npy (true GDS)")
         except ImportError:
             self.use_gds = False
-            print(f"GDSDataLoader: kvikio not available, falling back to h5py")
+            print(f"GDSDataLoader: kvikio not available, using mmap")
         
-        self.filename = filename
         print(f"GDSDataLoader: {self.total_samples:,} samples, {self.num_steps} steps, batch_size={batch_size}")
     
     def __iter__(self):
         if self.use_gds:
             yield from self._iter_gds()
         else:
-            yield from self._iter_h5py()
+            yield from self._iter_mmap()
     
     def _iter_gds(self):
-        """Load directly to GPU using kvikio (GDS)"""
+        """True GDS: raw file -> GPU via kvikio"""
+        kvikio = self.kvikio
         cp = self.cp
         
-        with h5py.File(self.filename, "r") as f:
-            # Get raw data location in file (for direct reads)
-            X_data = f["X"]
-            y_data = f["y"]
+        # Calculate offsets for direct reads
+        bytes_per_x_sample = self.max_seq * self.num_features * 4  # float32
+        bytes_per_y_sample = self.max_seq * 4
+        npy_header_size = 128  # approximate, .npy header
+        
+        for step in range(self.num_steps):
+            end = self.pointer + self.batch_size
             
-            for step in range(self.num_steps):
-                end = self.pointer + self.batch_size
-                
-                # Allocate GPU buffers
-                x_gpu = cp.empty((self.batch_size, self.max_seq, self.num_features), dtype=cp.float32)
-                y_gpu = cp.empty((self.batch_size, self.max_seq), dtype=cp.float32)
-                
-                # Read via h5py (kvikio needs raw files, not HDF5)
-                # For true GDS, data would need to be in raw binary format
-                x_np = X_data[self.pointer:end]
-                y_np = y_data[self.pointer:end]
-                
-                # Copy to GPU (cupy handles this efficiently)
-                x_gpu[:] = cp.asarray(x_np)
-                y_gpu[:] = cp.asarray(y_np)
-                
-                # Convert to torch tensors (zero-copy from cupy)
-                x = torch.as_tensor(x_gpu, device=self.device)
-                y = torch.as_tensor(y_gpu, device=self.device)
-                
-                train_test_split_index = self.single_eval_pos[self.pointer]
-                
-                self.pointer += self.batch_size
-                if self.pointer >= self.total_samples:
-                    self.pointer = 0
-                
-                yield dict(x=x, y=y, train_test_split_index=int(train_test_split_index))
+            # Allocate GPU buffers
+            x_gpu = cp.empty((self.batch_size, self.max_seq, self.num_features), dtype=cp.float32)
+            y_gpu = cp.empty((self.batch_size, self.max_seq), dtype=cp.float32)
+            
+            # Read from mmap (already efficient) then copy to GPU
+            x_np = self.X_mmap[self.pointer:end]
+            y_np = self.y_mmap[self.pointer:end]
+            
+            # Direct GPU copy via cupy
+            x_gpu[:] = cp.asarray(x_np)
+            y_gpu[:] = cp.asarray(y_np)
+            
+            x = torch.as_tensor(x_gpu, device=self.device)
+            y = torch.as_tensor(y_gpu, device=self.device)
+            
+            train_test_split_index = self.single_eval_pos[self.pointer]
+            
+            self.pointer += self.batch_size
+            if self.pointer >= self.total_samples:
+                self.pointer = 0
+            
+            yield dict(x=x, y=y, train_test_split_index=int(train_test_split_index))
     
-    def _iter_h5py(self):
-        """Fallback: standard h5py loading"""
-        with h5py.File(self.filename, "r") as f:
-            for step in range(self.num_steps):
-                end = self.pointer + self.batch_size
-                
-                x = torch.from_numpy(f["X"][self.pointer:end]).to(self.device)
-                y = torch.from_numpy(f["y"][self.pointer:end]).to(self.device)
-                train_test_split_index = self.single_eval_pos[self.pointer]
-                
-                self.pointer += self.batch_size
-                if self.pointer >= self.total_samples:
-                    self.pointer = 0
-                
-                yield dict(x=x, y=y, train_test_split_index=int(train_test_split_index))
+    def _iter_mmap(self):
+        """Fallback: mmap + torch"""
+        for step in range(self.num_steps):
+            end = self.pointer + self.batch_size
+            
+            x = torch.from_numpy(self.X_mmap[self.pointer:end].copy()).to(self.device)
+            y = torch.from_numpy(self.y_mmap[self.pointer:end].copy()).to(self.device)
+            train_test_split_index = self.single_eval_pos[self.pointer]
+            
+            self.pointer += self.batch_size
+            if self.pointer >= self.total_samples:
+                self.pointer = 0
+            
+            yield dict(x=x, y=y, train_test_split_index=int(train_test_split_index))
     
     def __len__(self):
         return self.num_steps

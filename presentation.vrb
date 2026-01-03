@@ -1,0 +1,9 @@
+\frametitle{GPU Direct Storage (kvikio)}
+\begin{lstlisting}[language=Python]
+import kvikio
+import cupy as cp
+
+x_gpu = cp.empty((batch_size, max_seq, num_features), dtype=cp.float32)
+x_gpu[:] = cp.asarray(f["X"][ptr:end])
+x = torch.as_tensor(x_gpu, device=self.device)
+\end{lstlisting}
