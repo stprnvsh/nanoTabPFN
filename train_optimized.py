@@ -301,11 +301,14 @@ class GDSDataLoader(DataLoader):
             self.mode = "mmap_cupy"
         else:
             if use_bin:
-                print(f"GDSDataLoader: .bin without kvikio, using numpy fromfile")
+                # .bin files need to be memory-mapped with np.memmap
+                self.X_mmap = np.memmap(self.x_path, dtype=np.float32, mode='r').reshape(self.total_samples, self.max_seq, self.num_features)
+                self.y_mmap = np.memmap(self.y_path, dtype=np.float32, mode='r').reshape(self.total_samples, self.max_seq)
+                print(f"GDSDataLoader: .bin mmap + torch (no kvikio)")
             else:
                 self.X_mmap = np.load(self.x_path, mmap_mode='r')
                 self.y_mmap = np.load(self.y_path, mmap_mode='r')
-            print(f"GDSDataLoader: mmap + torch")
+                print(f"GDSDataLoader: .npy mmap + torch")
             self.mode = "mmap_torch"
         
         print(f"GDSDataLoader: {self.total_samples:,} samples, {self.num_steps} steps, batch_size={batch_size}")

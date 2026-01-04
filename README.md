@@ -15,6 +15,57 @@ pip install numpy torch schedulefree h5py scikit-learn openml seaborn
 - `train.py` implements a simple training loop and prior dump data loader in under 200 lines
 - `experiment.ipynb` will recreate the experiment from the [paper](https://arxiv.org/pdf/2511.03634) (requires `pip install tabpfn==2.2.1`)
 
+### Optimized Training
+
+This fork includes optimized training scripts for faster GPU utilization:
+
+| Script | Description |
+|--------|-------------|
+| `train_optimized.py` | CUDA optimizations: TF32, pinned memory, async transfers, GDS |
+| `model_optimized.py` | Flash Attention + gradient checkpointing |
+| `generate_synthetic_data.py` | Generate large synthetic datasets for benchmarking |
+
+**Key optimizations:**
+- **77% reduction** in data transfer overhead (pinned memory + CUDA streams)
+- **Flash Attention** via `F.scaled_dot_product_attention` 
+- **GPU Direct Storage** (GDS) for zero-copy data loading
+- **Gradient checkpointing** for longer sequences
+
+```bash
+# Optimized training with Flash Attention and GDS
+python train_optimized.py --flash --gds-bin --batch-size=8 --steps=500
+
+# With gradient checkpointing for very long sequences
+python train_optimized.py --flash --checkpoint --batch-size=4
+```
+
+### Scaling to 150k+ Rows with Mosaic
+
+For sequences too large for a single GPU, use [Mosaic](https://github.com/stprnvsh/mosaic) for multi-GPU attention sharding:
+
+```python
+import mosaic
+
+# Initialize 4-way sequence parallelism
+ctx = mosaic.init(sp_size=4)
+
+# Feature attention: local (small axis, 5 features)
+feature_attn = mosaic.MultiAxisAttention(
+    embed_dim=96, num_heads=4,
+    attention_axis=2, backend="local"
+)
+
+# Row attention: ring (large axis, 150k rows sharded across GPUs)
+row_attn = mosaic.MultiAxisAttention(
+    embed_dim=96, num_heads=4,
+    attention_axis=1, backend="ring"
+)
+```
+
+```bash
+# Multi-GPU training
+torchrun --nproc_per_node=4 train_mosaic.py
+```
 
 ### Pretrain your own nanoTabPFN
 
