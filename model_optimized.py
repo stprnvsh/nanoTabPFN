@@ -4,15 +4,18 @@ Uses torch.nn.functional.scaled_dot_product_attention which auto-selects:
 - Flash Attention (if available)
 - Memory-efficient attention (xformers-style)
 - Math fallback
+
+Also supports gradient checkpointing to further reduce memory.
 """
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 class NanoTabPFNModelOptimized(nn.Module):
-    def __init__(self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, num_layers: int, num_outputs: int):
+    def __init__(self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, num_layers: int, num_outputs: int, use_checkpointing: bool = False):
         super().__init__()
         self.feature_encoder = FeatureEncoder(embedding_size)
         self.target_encoder = TargetEncoder(embedding_size)
@@ -20,6 +23,7 @@ class NanoTabPFNModelOptimized(nn.Module):
         for _ in range(num_layers):
             self.transformer_blocks.append(TransformerEncoderLayerOptimized(embedding_size, num_attention_heads, mlp_hidden_size))
         self.decoder = Decoder(embedding_size, mlp_hidden_size, num_outputs)
+        self.use_checkpointing = use_checkpointing
 
     def forward(self, src: tuple[torch.Tensor, torch.Tensor], train_test_split_index: int) -> torch.Tensor:
         x_src, y_src = src
@@ -30,7 +34,10 @@ class NanoTabPFNModelOptimized(nn.Module):
         y_src = self.target_encoder(y_src, num_rows)
         src = torch.cat([x_src, y_src], 2)
         for block in self.transformer_blocks:
-            src = block(src, train_test_split_index=train_test_split_index)
+            if self.use_checkpointing and self.training:
+                src = checkpoint(block, src, train_test_split_index, use_reentrant=False)
+            else:
+                src = block(src, train_test_split_index=train_test_split_index)
         output = src[:, train_test_split_index:, -1, :]
         output = self.decoder(output)
         return output
