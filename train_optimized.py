@@ -410,6 +410,7 @@ if __name__ == "__main__":
     parser.add_argument("--gds", action="store_true", help="Use GDS with .npy (mmap + cupy)")
     parser.add_argument("--gds-bin", action="store_true", help="TRUE GDS with .bin (disk -> GPU, no CPU)")
     parser.add_argument("--flash", action="store_true", help="Use Flash Attention model (O(n) memory)")
+    parser.add_argument("--checkpoint", action="store_true", help="Enable gradient checkpointing (saves memory)")
     args = parser.parse_args()
 
     device = get_default_device()
@@ -423,6 +424,7 @@ if __name__ == "__main__":
     print(f"Data file: {args.data}")
     print(f"GDS mode: {'bin (true GDS)' if args.gds_bin else 'npy' if args.gds else 'off'}")
     print(f"Flash Attention: {args.flash}")
+    print(f"Gradient checkpointing: {args.checkpoint}")
     
     # Determine GDS mode
     use_gds = args.gds or args.gds_bin
@@ -438,7 +440,8 @@ if __name__ == "__main__":
             num_attention_heads=4,
             mlp_hidden_size=192,
             num_layers=3,
-            num_outputs=2
+            num_outputs=2,
+            use_checkpointing=args.checkpoint
         )
     else:
         model = NanoTabPFNModel(
