@@ -433,6 +433,12 @@ class PriorDumpDataLoader(DataLoader):
         
     def __iter__(self):
         with h5py.File(self.filename, "r") as f:
+            # No prefetch: simple synchronous loading
+            if self.num_prefetch == 0:
+                for step in range(self.num_steps):
+                    yield self._load_to_vram(f)
+                return
+            
             # Pre-fill VRAM buffer with first N batches
             vram_buffer = []
             for _ in range(min(self.num_prefetch, self.num_steps)):
