@@ -10,6 +10,7 @@ Optimized training with GPU utilization improvements:
 """
 import random
 import time
+from collections import defaultdict
 import h5py
 import numpy as np
 import schedulefree
@@ -21,6 +22,284 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_sco
 from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.utils.data import DataLoader
+
+
+# =============================================================================
+# MODEL PROFILING UTILITIES
+# =============================================================================
+
+class LayerProfiler:
+    """Profiles individual layers with timing and memory tracking."""
+    
+    def __init__(self):
+        self.timings = defaultdict(list)
+        self.memory = defaultdict(list)
+        self.shapes = {}
+        self.hooks = []
+        self.enabled = False
+    
+    def _get_mem_mb(self):
+        if torch.cuda.is_available():
+            return torch.cuda.memory_allocated() / 1e6
+        return 0
+    
+    def attach(self, model):
+        """Attach timing hooks to all layers."""
+        for name, module in model.named_modules():
+            if len(list(module.children())) == 0:  # Leaf modules only
+                self.hooks.append(module.register_forward_pre_hook(
+                    self._make_pre_hook(name)))
+                self.hooks.append(module.register_forward_hook(
+                    self._make_post_hook(name)))
+        return self
+    
+    def _make_pre_hook(self, name):
+        def hook(module, input):
+            if not self.enabled:
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._start_time = time.perf_counter()
+            self._start_mem = self._get_mem_mb()
+            # Record input shape
+            if input and hasattr(input[0], 'shape'):
+                self.shapes[name] = tuple(input[0].shape)
+        return hook
+    
+    def _make_post_hook(self, name):
+        def hook(module, input, output):
+            if not self.enabled:
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - self._start_time) * 1000  # ms
+            mem_delta = self._get_mem_mb() - self._start_mem
+            self.timings[name].append(elapsed)
+            self.memory[name].append(mem_delta)
+        return hook
+    
+    def enable(self):
+        self.enabled = True
+    
+    def disable(self):
+        self.enabled = False
+    
+    def reset(self):
+        self.timings.clear()
+        self.memory.clear()
+        self.shapes.clear()
+    
+    def remove_hooks(self):
+        for h in self.hooks:
+            h.remove()
+        self.hooks.clear()
+    
+    def summary(self, top_k=20):
+        """Print summary sorted by total time."""
+        rows = []
+        for name in self.timings:
+            times = self.timings[name]
+            mems = self.memory[name]
+            shape = self.shapes.get(name, ())
+            rows.append({
+                'name': name,
+                'calls': len(times),
+                'total_ms': sum(times),
+                'avg_ms': sum(times) / len(times) if times else 0,
+                'mem_mb': sum(mems) / len(mems) if mems else 0,
+                'shape': shape
+            })
+        
+        rows.sort(key=lambda x: x['total_ms'], reverse=True)
+        
+        print(f"\n{'='*90}")
+        print(f"{'LAYER PROFILING SUMMARY':^90}")
+        print(f"{'='*90}")
+        print(f"{'Layer':<45} {'Calls':>6} {'Total(ms)':>10} {'Avg(ms)':>9} {'Mem(MB)':>9}")
+        print(f"{'-'*90}")
+        
+        total_time = sum(r['total_ms'] for r in rows)
+        for r in rows[:top_k]:
+            pct = 100 * r['total_ms'] / total_time if total_time > 0 else 0
+            print(f"{r['name'][:44]:<45} {r['calls']:>6} {r['total_ms']:>9.2f} {r['avg_ms']:>9.3f} {r['mem_mb']:>+8.1f}")
+        
+        print(f"{'-'*90}")
+        print(f"{'TOTAL':<45} {'':<6} {total_time:>9.2f}ms")
+        return rows
+
+
+class ModelProfiler:
+    """High-level profiler for the full training step."""
+    
+    def __init__(self, device='cuda'):
+        self.device = device
+        self.step_times = defaultdict(list)
+        self.memory_snapshots = []
+    
+    def _sync(self):
+        if self.device == 'cuda':
+            torch.cuda.synchronize()
+    
+    def _mem_stats(self):
+        if self.device != 'cuda':
+            return {}
+        return {
+            'allocated_mb': torch.cuda.memory_allocated() / 1e6,
+            'reserved_mb': torch.cuda.memory_reserved() / 1e6,
+            'max_allocated_mb': torch.cuda.max_memory_allocated() / 1e6,
+        }
+    
+    def profile_step(self, model, data, targets, train_test_split_index, criterion, optimizer):
+        """Profile a single training step with detailed breakdown."""
+        times = {}
+        mems = {}
+        
+        # Reset peak memory
+        if self.device == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+        
+        mems['start'] = self._mem_stats()
+        
+        # Forward pass
+        self._sync()
+        t0 = time.perf_counter()
+        output = model(data, train_test_split_index=train_test_split_index)
+        output = output.view(-1, output.shape[-1])
+        self._sync()
+        times['forward'] = (time.perf_counter() - t0) * 1000
+        mems['after_forward'] = self._mem_stats()
+        
+        # Loss computation
+        t0 = time.perf_counter()
+        loss = criterion(output, targets)
+        self._sync()
+        times['loss'] = (time.perf_counter() - t0) * 1000
+        mems['after_loss'] = self._mem_stats()
+        
+        # Backward pass
+        t0 = time.perf_counter()
+        loss.backward()
+        self._sync()
+        times['backward'] = (time.perf_counter() - t0) * 1000
+        mems['after_backward'] = self._mem_stats()
+        
+        # Gradient clipping
+        t0 = time.perf_counter()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+        self._sync()
+        times['grad_clip'] = (time.perf_counter() - t0) * 1000
+        
+        # Optimizer step
+        t0 = time.perf_counter()
+        optimizer.step()
+        self._sync()
+        times['optimizer'] = (time.perf_counter() - t0) * 1000
+        
+        # Zero grad
+        t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        self._sync()
+        times['zero_grad'] = (time.perf_counter() - t0) * 1000
+        mems['end'] = self._mem_stats()
+        
+        # Record
+        for k, v in times.items():
+            self.step_times[k].append(v)
+        self.memory_snapshots.append(mems)
+        
+        return loss, times, mems
+    
+    def summary(self):
+        """Print profiling summary."""
+        print(f"\n{'='*70}")
+        print(f"{'TRAINING STEP BREAKDOWN':^70}")
+        print(f"{'='*70}")
+        print(f"{'Phase':<20} {'Total(ms)':>12} {'Avg(ms)':>12} {'%':>8}")
+        print(f"{'-'*70}")
+        
+        total = sum(sum(v) for v in self.step_times.values())
+        for phase in ['forward', 'loss', 'backward', 'grad_clip', 'optimizer', 'zero_grad']:
+            times = self.step_times.get(phase, [])
+            if times:
+                t = sum(times)
+                pct = 100 * t / total if total > 0 else 0
+                print(f"{phase:<20} {t:>12.2f} {t/len(times):>12.3f} {pct:>7.1f}%")
+        
+        print(f"{'-'*70}")
+        n_steps = len(self.step_times.get('forward', [1]))
+        print(f"{'TOTAL':<20} {total:>12.2f} {total/n_steps:>12.3f}ms/step")
+        
+        # Memory summary
+        if self.memory_snapshots:
+            last = self.memory_snapshots[-1]
+            print(f"\n{'MEMORY (final step)':<70}")
+            print(f"{'-'*70}")
+            print(f"  After forward:  {last.get('after_forward', {}).get('allocated_mb', 0):>8.1f} MB allocated")
+            print(f"  After backward: {last.get('after_backward', {}).get('allocated_mb', 0):>8.1f} MB allocated")
+            print(f"  Peak:           {last.get('after_backward', {}).get('max_allocated_mb', 0):>8.1f} MB")
+
+
+def profile_attention_ops(model, x, y, train_test_split_index, device='cuda'):
+    """Profile attention operations specifically."""
+    from torch.profiler import profile, ProfilerActivity, record_function
+    
+    print(f"\n{'='*80}")
+    print(f"{'ATTENTION OPERATION BREAKDOWN':^80}")
+    print(f"{'='*80}")
+    
+    data = (x, y[:, :train_test_split_index])
+    
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if device == 'cuda' else [ProfilerActivity.CPU],
+        record_shapes=True,
+        with_stack=False,
+    ) as prof:
+        with record_function("model_forward"):
+            _ = model(data, train_test_split_index=train_test_split_index)
+    
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    
+    # Filter and display attention-related ops
+    print(f"\n{'Operation':<40} {'CUDA(ms)':>10} {'CPU(ms)':>10} {'Calls':>8} {'Shape'}")
+    print(f"{'-'*80}")
+    
+    attn_ops = ['bmm', 'matmul', 'softmax', 'scaled_dot', 'attention', 'linear', 'layer_norm', 'gelu']
+    
+    for evt in prof.key_averages(group_by_input_shape=True):
+        if any(op in evt.key.lower() for op in attn_ops):
+            cuda_t = getattr(evt, 'cuda_time_total', 0) / 1000  # to ms
+            cpu_t = evt.cpu_time_total / 1000
+            shapes = str(evt.input_shapes)[:30] if evt.input_shapes else ''
+            print(f"{evt.key[:39]:<40} {cuda_t:>10.3f} {cpu_t:>10.3f} {evt.count:>8} {shapes}")
+    
+    # Compute breakdown
+    print(f"\n{'COMPUTE CATEGORY SUMMARY':^80}")
+    print(f"{'-'*80}")
+    
+    categories = {
+        'Attention (bmm/matmul)': ['bmm', 'matmul', 'scaled_dot'],
+        'Softmax': ['softmax'],
+        'Linear layers': ['linear', 'addmm'],
+        'Normalization': ['layer_norm', 'native_layer_norm'],
+        'Activations': ['gelu', 'relu'],
+        'Memory ops': ['copy_', 'to', 'contiguous', 'reshape', 'view'],
+    }
+    
+    cat_times = defaultdict(float)
+    for evt in prof.key_averages():
+        cuda_t = getattr(evt, 'cuda_time_total', 0) / 1000
+        for cat, keywords in categories.items():
+            if any(kw in evt.key.lower() for kw in keywords):
+                cat_times[cat] += cuda_t
+                break
+    
+    total = sum(cat_times.values())
+    for cat, t in sorted(cat_times.items(), key=lambda x: -x[1]):
+        pct = 100 * t / total if total > 0 else 0
+        print(f"  {cat:<30} {t:>10.2f}ms  ({pct:>5.1f}%)")
+    
+    return prof
 
 
 def set_randomness_seed(seed):
@@ -403,7 +682,8 @@ class GDSDataLoader(DataLoader):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile", action="store_true", help="Profile with PyTorch profiler (ops-level)")
+    parser.add_argument("--profile-model", action="store_true", help="Detailed model profiling (layer-by-layer)")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
     parser.add_argument("--batch-size", type=int, default=64, help="Larger batch = better GPU util")
     parser.add_argument("--steps", type=int, default=100, help="Training steps for timing")
@@ -460,7 +740,91 @@ if __name__ == "__main__":
         print("Compiling model...")
         model = torch.compile(model)
 
-    if args.profile:
+    if args.profile_model:
+        # =====================================================================
+        # DETAILED MODEL PROFILING MODE
+        # =====================================================================
+        print("\n" + "="*70)
+        print(" DETAILED MODEL PROFILING MODE ".center(70, "="))
+        print("="*70)
+        
+        # Warmup
+        print("\nWarming up...")
+        if use_gds:
+            warmup_prior = GDSDataLoader(args.data, num_steps=3, batch_size=args.batch_size, device=device, use_bin=use_bin)
+        else:
+            warmup_prior = PriorDumpDataLoader(args.data, num_steps=3, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        train(model, warmup_prior, lr=4e-3, steps_per_eval=100)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        
+        # Setup profilers
+        layer_profiler = LayerProfiler()
+        # Only attach to non-compiled model (compiled model's hooks won't work well)
+        if args.no_compile:
+            layer_profiler.attach(model)
+        
+        model_profiler = ModelProfiler(device=device)
+        
+        # Load data
+        if use_gds:
+            prior = GDSDataLoader(args.data, num_steps=args.steps, batch_size=args.batch_size, device=device, use_bin=use_bin)
+        else:
+            prior = PriorDumpDataLoader(args.data, num_steps=args.steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        
+        print(f"\nProfiling {args.steps} training steps...")
+        print(f"Input shape: (batch={args.batch_size}, rows=variable, cols=variable, embed=96)")
+        
+        model.to(device)
+        optimizer = schedulefree.AdamWScheduleFree(model.parameters(), lr=4e-3, weight_decay=0.0)
+        criterion = nn.CrossEntropyLoss()
+        model.train()
+        optimizer.train()
+        
+        # Enable layer profiling
+        if args.no_compile:
+            layer_profiler.enable()
+        
+        # Profile each step
+        for step, full_data in enumerate(prior):
+            train_test_split_index = full_data["train_test_split_index"]
+            x = full_data["x"]
+            y_full = full_data["y"]
+            
+            data = (x, y_full[:, :train_test_split_index])
+            targets = y_full[:, train_test_split_index:].reshape(-1).long()
+            
+            # First step: also profile attention ops
+            if step == 0:
+                print(f"\nStep 0 shapes: x={tuple(x.shape)}, y={tuple(y_full.shape)}, split={train_test_split_index}")
+                profile_attention_ops(model, x, y_full, train_test_split_index, device)
+            
+            loss, times, mems = model_profiler.profile_step(
+                model, data, targets, train_test_split_index, criterion, optimizer
+            )
+            
+            if step % 10 == 0:
+                mem_alloc = mems['after_backward'].get('allocated_mb', 0) if mems['after_backward'] else 0
+                print(f"  Step {step:3d}: fwd={times['forward']:6.1f}ms  bwd={times['backward']:6.1f}ms  mem={mem_alloc:6.0f}MB  loss={loss.item():.4f}")
+        
+        # Print summaries
+        model_profiler.summary()
+        
+        if args.no_compile:
+            layer_profiler.disable()
+            layer_profiler.summary(top_k=25)
+            layer_profiler.remove_hooks()
+        else:
+            print("\n[Note: Layer-level profiling disabled with torch.compile. Use --no-compile for layer breakdown.]")
+        
+        # Memory analysis
+        if device == "cuda":
+            print(f"\n{'='*70}")
+            print(f"{'CUDA MEMORY ANALYSIS':^70}")
+            print(f"{'='*70}")
+            print(torch.cuda.memory_summary(abbreviated=True))
+    
+    elif args.profile:
         from torch.profiler import profile, ProfilerActivity
         
         # Warmup for torch.compile (captures compilation time separately)
