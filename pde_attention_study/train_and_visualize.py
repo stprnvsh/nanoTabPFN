@@ -4,9 +4,9 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 import numpy as np
 from pde_data import generate_heat_equation_1d, generate_wave_equation_1d, generate_ood_heat_data
-from model import PDETransformer
+from model import PDETransformer, FNO1D, GIN1D
 
-def train(pde_type='heat', n_epochs=100, lr=1e-3, n_layers=1):
+def train(pde_type='heat', n_epochs=100, lr=1e-3, n_layers=1, model_type='transformer'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -22,8 +22,15 @@ def train(pde_type='heat', n_epochs=100, lr=1e-3, n_layers=1):
     test_sol = solutions[800:].to(device)
     
     # Model
-    print(f"Model: {n_layers} layer(s), 4 heads, 64 dim")
-    model = PDETransformer(d_model=64, n_heads=4, n_layers=n_layers).to(device)
+    if model_type == 'fno':
+        print(f"Model: FNO, {n_layers} layer(s), 64 dim, 16 modes")
+        model = FNO1D(d_model=64, modes=16, n_layers=n_layers).to(device)
+    elif model_type == 'gin':
+        print(f"Model: GIN, {n_layers} layer(s), 64 dim, 16 manifold points")
+        model = GIN1D(d_model=64, num_manifold_points=16, n_heads=4, n_layers=n_layers).to(device)
+    else:
+        print(f"Model: Transformer, {n_layers} layer(s), 4 heads, 64 dim")
+        model = PDETransformer(d_model=64, n_heads=4, n_layers=n_layers).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     
@@ -66,7 +73,7 @@ def train(pde_type='heat', n_epochs=100, lr=1e-3, n_layers=1):
     
     return model, losses, test_sol
 
-def visualize_attention(model, test_data, pde_type='heat'):
+def visualize_attention(model, test_data, pde_type='heat', model_type='transformer'):
     """Visualize what the attention has learned."""
     model.eval()
     device = next(model.parameters()).device
@@ -79,9 +86,11 @@ def visualize_attention(model, test_data, pde_type='heat'):
     with torch.no_grad():
         pred, attn = model(x, return_attention=True)
     
-    # attn shape: (n_layers, B, n_heads, S, S)
-    attn = attn[:, 0].cpu().numpy()  # (n_layers, n_heads, S, S)
+    # attn shape: (n_layers, B, n_heads, S, S) for transformer
+    #             (n_layers, B, n_heads, S, K) for GIN
+    attn = attn[:, 0].cpu().numpy()  # (n_layers, n_heads, S, K or S)
     n_heads = attn.shape[1]
+    is_gin = model_type == 'gin'
     
     # Create figure based on number of layers
     fig, axes = plt.subplots(n_layers, 4, figsize=(16, 4*n_layers))
@@ -89,15 +98,15 @@ def visualize_attention(model, test_data, pde_type='heat'):
         axes = axes.reshape(1, -1)
     
     for layer in range(n_layers):
-        layer_attn = attn[layer]  # (n_heads, S, S)
+        layer_attn = attn[layer]  # (n_heads, S, K or S)
         
         # Plot each head
         for h in range(min(n_heads, 3)):
             ax = axes[layer, h]
             im = ax.imshow(layer_attn[h], cmap='viridis', aspect='auto')
             ax.set_title(f'L{layer+1} Head {h+1}')
-            ax.set_xlabel('Key')
-            ax.set_ylabel('Query')
+            ax.set_xlabel('Manifold Point' if is_gin else 'Key')
+            ax.set_ylabel('Query (spatial)')
             plt.colorbar(im, ax=ax)
         
         # Average attention for this layer
@@ -105,11 +114,13 @@ def visualize_attention(model, test_data, pde_type='heat'):
         center = x.shape[1] // 2
         for h in range(n_heads):
             ax.plot(layer_attn[h, center, :], label=f'H{h+1}', alpha=0.7)
-        ax.axvline(x=center, color='red', linestyle='--')
-        ax.set_title(f'L{layer+1} from center')
+        if not is_gin:
+            ax.axvline(x=center, color='red', linestyle='--')
+        ax.set_title(f'L{layer+1} from center pos')
         ax.legend(fontsize=8)
     
-    plt.suptitle(f'{pde_type.capitalize()} Equation - {n_layers} Layer(s)')
+    model_name = model_type.upper()
+    plt.suptitle(f'{pde_type.capitalize()} Equation - {model_name} {n_layers} Layer(s)')
     plt.tight_layout()
     plt.savefig(f'attention_patterns_{pde_type}.png', dpi=150)
     plt.show()
@@ -117,34 +128,49 @@ def visualize_attention(model, test_data, pde_type='heat'):
     # Return last layer attention for compatibility
     return attn[-1]
 
-def analyze_attention_locality(attn, pde_type):
+def analyze_attention_locality(attn, pde_type, model_type='transformer'):
     """Analyze if attention learns local (finite difference-like) patterns."""
-    n_heads, seq_len, _ = attn.shape
+    n_heads, seq_len, key_len = attn.shape
+    is_gin = model_type == 'gin'
     
-    print(f"\n=== Attention Analysis for {pde_type} equation ===")
+    print(f"\n=== Attention Analysis for {pde_type} equation ({model_type.upper()}) ===")
     
-    for h in range(n_heads):
-        head_attn = attn[h]
-        
-        # Measure locality: how much weight is on neighbors
-        local_weight = 0
-        for i in range(1, seq_len - 1):
-            neighbors = [i-1, i, i+1]
-            local_weight += sum(head_attn[i, j] for j in neighbors)
-        local_weight /= (seq_len - 2)
-        
-        # Find dominant pattern
-        avg_row = head_attn[seq_len//4:3*seq_len//4, :].mean(axis=0)
-        peak_offset = np.argmax(avg_row) - seq_len // 2
-        
-        print(f"Head {h+1}:")
-        print(f"  Local weight (3 neighbors): {local_weight:.3f}")
-        print(f"  Peak attention offset: {peak_offset}")
-        
-        # Check if it resembles finite difference stencil
-        center = seq_len // 2
-        stencil = head_attn[center, center-2:center+3]
-        print(f"  Stencil pattern at center: {stencil}")
+    if is_gin:
+        # GIN: analyze which manifold points are most attended
+        print(f"Manifold points: {key_len}")
+        for h in range(n_heads):
+            head_attn = attn[h]  # (S, K)
+            # Average attention per manifold point
+            avg_per_manifold = head_attn.mean(axis=0)
+            top_points = np.argsort(avg_per_manifold)[-3:][::-1]
+            print(f"Head {h+1}:")
+            print(f"  Top manifold points: {top_points}")
+            print(f"  Attention spread: {avg_per_manifold.std():.4f}")
+            print(f"  Max attention: {avg_per_manifold.max():.4f}")
+    else:
+        # Transformer: analyze locality patterns
+        for h in range(n_heads):
+            head_attn = attn[h]
+            
+            # Measure locality: how much weight is on neighbors
+            local_weight = 0
+            for i in range(1, seq_len - 1):
+                neighbors = [i-1, i, i+1]
+                local_weight += sum(head_attn[i, j] for j in neighbors)
+            local_weight /= (seq_len - 2)
+            
+            # Find dominant pattern
+            avg_row = head_attn[seq_len//4:3*seq_len//4, :].mean(axis=0)
+            peak_offset = np.argmax(avg_row) - seq_len // 2
+            
+            print(f"Head {h+1}:")
+            print(f"  Local weight (3 neighbors): {local_weight:.3f}")
+            print(f"  Peak attention offset: {peak_offset}")
+            
+            # Check if it resembles finite difference stencil
+            center = seq_len // 2
+            stencil = head_attn[center, center-2:center+3]
+            print(f"  Stencil pattern at center: {stencil}")
 
 def rollout_prediction(model, initial, n_steps, device):
     """Rollout model predictions autoregressively."""
@@ -196,10 +222,11 @@ def visualize_rollout(model, test_data, pde_type):
     plt.show()
 
 
-def visualize_attention_vs_distance(model, test_data):
+def visualize_attention_vs_distance(model, test_data, model_type='transformer'):
     """Plot attention weight as function of spatial distance."""
     model.eval()
     device = next(model.parameters()).device
+    is_gin = model_type == 'gin'
     
     # Collect attention from multiple samples (use last layer)
     all_attns = []
@@ -207,47 +234,68 @@ def visualize_attention_vs_distance(model, test_data):
         x = test_data[i, 0:1, :].to(device)
         with torch.no_grad():
             _, attn = model(x, return_attention=True)
-        # attn: (n_layers, B, n_heads, S, S) -> take last layer, first batch
+        # attn: (n_layers, B, n_heads, S, S or K) -> take last layer, first batch
         all_attns.append(attn[-1, 0].cpu().numpy())
     
-    all_attns = np.stack(all_attns)  # (n_samples, n_heads, seq, seq)
+    all_attns = np.stack(all_attns)  # (n_samples, n_heads, seq, seq or K)
     n_heads = all_attns.shape[1]
     seq_len = all_attns.shape[2]
     
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     
-    # Attention vs distance for each head
-    ax = axes[0]
-    for h in range(n_heads):
-        distances = []
-        weights = []
-        for d in range(-seq_len//2, seq_len//2):
-            w = []
-            for i in range(seq_len):
-                j = i + d
-                if 0 <= j < seq_len:
-                    w.append(all_attns[:, h, i, j].mean())
-            if w:
-                distances.append(d)
-                weights.append(np.mean(w))
-        ax.plot(distances, weights, label=f'Head {h+1}', linewidth=2)
-    ax.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
-    ax.set_xlabel('Relative Position (Key - Query)')
-    ax.set_ylabel('Average Attention Weight')
-    ax.set_title('Attention vs Spatial Distance')
-    ax.legend()
-    
-    # Combined view - heat map of distance-based attention
-    ax = axes[1]
-    avg_attn = all_attns.mean(axis=(0, 1))  # (seq, seq)
-    dist_attn = np.zeros((seq_len, seq_len))
-    for i in range(seq_len):
-        for j in range(seq_len):
-            dist_attn[i, j] = abs(i - j)
-    ax.scatter(dist_attn.flatten(), avg_attn.flatten(), alpha=0.1, s=5)
-    ax.set_xlabel('Spatial Distance |i - j|')
-    ax.set_ylabel('Attention Weight')
-    ax.set_title('Distance vs Attention (all pairs)')
+    if is_gin:
+        # GIN: show average attention per manifold point
+        ax = axes[0]
+        avg_attn = all_attns.mean(axis=(0, 2))  # (n_heads, K)
+        for h in range(n_heads):
+            ax.bar(np.arange(avg_attn.shape[1]) + h*0.2, avg_attn[h], width=0.2, label=f'Head {h+1}', alpha=0.7)
+        ax.set_xlabel('Manifold Point')
+        ax.set_ylabel('Average Attention Weight')
+        ax.set_title('GIN: Attention per Manifold Point')
+        ax.legend()
+        
+        # Per-position attention profile
+        ax = axes[1]
+        avg_attn = all_attns.mean(axis=0)  # (n_heads, seq, K)
+        for h in range(n_heads):
+            ax.plot(avg_attn[h].mean(axis=1), label=f'Head {h+1}', linewidth=2)
+        ax.set_xlabel('Spatial Position')
+        ax.set_ylabel('Total Attention (sum over manifold)')
+        ax.set_title('GIN: Attention Sum by Position')
+        ax.legend()
+    else:
+        # Attention vs distance for each head
+        ax = axes[0]
+        for h in range(n_heads):
+            distances = []
+            weights = []
+            for d in range(-seq_len//2, seq_len//2):
+                w = []
+                for i in range(seq_len):
+                    j = i + d
+                    if 0 <= j < seq_len:
+                        w.append(all_attns[:, h, i, j].mean())
+                if w:
+                    distances.append(d)
+                    weights.append(np.mean(w))
+            ax.plot(distances, weights, label=f'Head {h+1}', linewidth=2)
+        ax.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
+        ax.set_xlabel('Relative Position (Key - Query)')
+        ax.set_ylabel('Average Attention Weight')
+        ax.set_title('Attention vs Spatial Distance')
+        ax.legend()
+        
+        # Combined view - heat map of distance-based attention
+        ax = axes[1]
+        avg_attn = all_attns.mean(axis=(0, 1))  # (seq, seq)
+        dist_attn = np.zeros((seq_len, seq_len))
+        for i in range(seq_len):
+            for j in range(seq_len):
+                dist_attn[i, j] = abs(i - j)
+        ax.scatter(dist_attn.flatten(), avg_attn.flatten(), alpha=0.1, s=5)
+        ax.set_xlabel('Spatial Distance |i - j|')
+        ax.set_ylabel('Attention Weight')
+        ax.set_title('Distance vs Attention (all pairs)')
     
     plt.tight_layout()
     plt.savefig('attention_vs_distance.png', dpi=150)
@@ -347,10 +395,11 @@ def test_ood_generalization(model, pde_type='heat'):
     plt.savefig('ood_generalization.png', dpi=150)
     plt.show()
 
-def visualize_what_attention_learns_summary(model, test_data, pde_type):
+def visualize_what_attention_learns_summary(model, test_data, pde_type, model_type='transformer'):
     """Summary visualization of attention learning."""
     model.eval()
     device = next(model.parameters()).device
+    is_gin = model_type == 'gin'
     
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     
@@ -358,28 +407,36 @@ def visualize_what_attention_learns_summary(model, test_data, pde_type):
     x = test_data[0, 0:1, :].to(device)
     with torch.no_grad():
         _, attn = model(x, return_attention=True)
-    # attn: (n_layers, B, n_heads, S, S) -> last layer, first batch
+    # attn: (n_layers, B, n_heads, S, S or K) -> last layer, first batch
     attn = attn[-1, 0].cpu().numpy()
     n_heads = attn.shape[0]
     seq_len = attn.shape[1]
+    key_len = attn.shape[2]
     
-    # 1. Average attention pattern (should show locality)
+    # 1. Average attention pattern
     ax = axes[0, 0]
     avg_attn = attn.mean(axis=0)
     im = ax.imshow(avg_attn, cmap='viridis', aspect='auto')
     ax.set_title('Avg Attention Pattern')
-    ax.set_xlabel('Key (spatial)')
+    ax.set_xlabel('Manifold Point' if is_gin else 'Key (spatial)')
     ax.set_ylabel('Query (spatial)')
     plt.colorbar(im, ax=ax)
     
-    # 2. Diagonal dominance - attention concentrates near diagonal for local ops
+    # 2. For transformer: diagonal dominance. For GIN: manifold point importance
     ax = axes[0, 1]
-    for h in range(n_heads):
-        diag_vals = np.diag(attn[h])
-        ax.plot(diag_vals, label=f'Head {h+1}', alpha=0.7)
-    ax.set_title('Diagonal Attention (self-attention strength)')
-    ax.set_xlabel('Position')
-    ax.set_ylabel('Self-attention weight')
+    if is_gin:
+        for h in range(n_heads):
+            ax.plot(attn[h].mean(axis=0), label=f'Head {h+1}', alpha=0.7)
+        ax.set_title('Manifold Point Importance')
+        ax.set_xlabel('Manifold Point')
+        ax.set_ylabel('Avg attention weight')
+    else:
+        for h in range(n_heads):
+            diag_vals = np.diag(attn[h])
+            ax.plot(diag_vals, label=f'Head {h+1}', alpha=0.7)
+        ax.set_title('Diagonal Attention (self-attention strength)')
+        ax.set_xlabel('Position')
+        ax.set_ylabel('Self-attention weight')
     ax.legend()
     
     # 3. Attention entropy - low entropy = focused, high = diffuse
@@ -387,26 +444,28 @@ def visualize_what_attention_learns_summary(model, test_data, pde_type):
     for h in range(n_heads):
         entropy = -np.sum(attn[h] * np.log(attn[h] + 1e-10), axis=1)
         ax.plot(entropy, label=f'Head {h+1}', alpha=0.7)
-    max_entropy = np.log(seq_len)
+    max_entropy = np.log(key_len)
     ax.axhline(y=max_entropy, color='r', linestyle='--', label='Max entropy')
     ax.set_title('Attention Entropy (lower = more focused)')
     ax.set_xlabel('Query position')
     ax.set_ylabel('Entropy')
     ax.legend()
     
-    # 4. Effective receptive field
+    # 4. Effective receptive field from center
     ax = axes[1, 1]
     center = seq_len // 2
     for h in range(n_heads):
         attn_row = attn[h, center, :]
         ax.plot(attn_row, label=f'Head {h+1}', linewidth=2)
-    ax.axvline(x=center, color='r', linestyle='--', alpha=0.5)
-    ax.set_title(f'Receptive Field from Center (pos {center})')
-    ax.set_xlabel('Key position')
+    if not is_gin:
+        ax.axvline(x=center, color='r', linestyle='--', alpha=0.5)
+    ax.set_title(f'Attention from Center (pos {center})')
+    ax.set_xlabel('Manifold Point' if is_gin else 'Key position')
     ax.set_ylabel('Attention weight')
     ax.legend()
     
-    plt.suptitle(f'{pde_type.capitalize()} Equation - Attention Analysis Summary', fontsize=14)
+    model_name = model_type.upper()
+    plt.suptitle(f'{pde_type.capitalize()} Equation - {model_name} Analysis Summary', fontsize=14)
     plt.tight_layout()
     plt.savefig(f'attention_summary_{pde_type}.png', dpi=150)
     plt.show()
@@ -417,25 +476,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--pde', type=str, default='heat', choices=['heat', 'wave'])
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--layers', type=int, default=1, help='Number of attention layers')
+    parser.add_argument('--layers', type=int, default=1, help='Number of layers')
+    parser.add_argument('--model', type=str, default='transformer', choices=['transformer', 'fno', 'gin'], help='Model type')
     args = parser.parse_args()
     
     # Train
-    model, losses, test_data = train(pde_type=args.pde, n_epochs=args.epochs, n_layers=args.layers)
+    model, losses, test_data = train(pde_type=args.pde, n_epochs=args.epochs, n_layers=args.layers, model_type=args.model)
     
     # Save model
-    torch.save(model.state_dict(), f'model_{args.pde}.pt')
+    torch.save(model.state_dict(), f'model_{args.model}_{args.pde}.pt')
     
     # Visualizations
     print("\n=== Attention Patterns ===")
-    attn = visualize_attention(model, test_data, args.pde)
-    analyze_attention_locality(attn, args.pde)
+    attn = visualize_attention(model, test_data, args.pde, args.model)
+    analyze_attention_locality(attn, args.pde, args.model)
     
     print("\n=== Attention Summary ===")
-    visualize_what_attention_learns_summary(model, test_data, args.pde)
+    visualize_what_attention_learns_summary(model, test_data, args.pde, args.model)
     
     print("\n=== Attention vs Distance ===")
-    visualize_attention_vs_distance(model, test_data)
+    visualize_attention_vs_distance(model, test_data, args.model)
     
     print("\n=== Learned Stencil (Response to Delta) ===")
     compare_to_finite_difference(model, n_points=64)
