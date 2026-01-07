@@ -855,7 +855,7 @@ if __name__ == "__main__":
     print(f"Flash Attention: {args.flash}")
     if args.flash:
         if args.num_kv_heads:
-            print(f"GQA: {args.num_attention_heads} Q heads, {args.num_kv_heads} K,V heads")
+            print(f"GQA: 4 Q heads, {args.num_kv_heads} K,V heads")
         if args.save_peak_mem_factor:
             print(f"Batch chunking: factor={args.save_peak_mem_factor}")
     print(f"Gradient checkpointing: {args.checkpoint}")
