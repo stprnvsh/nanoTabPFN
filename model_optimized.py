@@ -15,17 +15,30 @@ from torch.utils.checkpoint import checkpoint
 
 
 class NanoTabPFNModelOptimized(nn.Module):
-    def __init__(self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, num_layers: int, num_outputs: int, use_checkpointing: bool = False):
+    def __init__(self, embedding_size: int, num_attention_heads: int, mlp_hidden_size: int, 
+                 num_layers: int, num_outputs: int, use_checkpointing: bool = False,
+                 num_kv_heads: int = None):
         super().__init__()
         self.feature_encoder = FeatureEncoder(embedding_size)
         self.target_encoder = TargetEncoder(embedding_size)
         self.transformer_blocks = nn.ModuleList()
         for _ in range(num_layers):
-            self.transformer_blocks.append(TransformerEncoderLayerOptimized(embedding_size, num_attention_heads, mlp_hidden_size))
+            self.transformer_blocks.append(
+                TransformerEncoderLayerOptimized(
+                    embedding_size, num_attention_heads, mlp_hidden_size,
+                    num_kv_heads=num_kv_heads
+                )
+            )
         self.decoder = Decoder(embedding_size, mlp_hidden_size, num_outputs)
         self.use_checkpointing = use_checkpointing
 
-    def forward(self, src: tuple[torch.Tensor, torch.Tensor], train_test_split_index: int) -> torch.Tensor:
+    def forward(self, src: tuple[torch.Tensor, torch.Tensor], train_test_split_index: int,
+                save_peak_mem_factor: int = None) -> torch.Tensor:
+        """
+        Args:
+            save_peak_mem_factor: If set, chunks along batch dimension to reduce peak memory.
+                                  Only works during inference (no gradients).
+        """
         x_src, y_src = src
         if len(y_src.shape) < len(x_src.shape):
             y_src = y_src.unsqueeze(-1)
@@ -37,7 +50,8 @@ class NanoTabPFNModelOptimized(nn.Module):
             if self.use_checkpointing and self.training:
                 src = checkpoint(block, src, train_test_split_index, use_reentrant=False)
             else:
-                src = block(src, train_test_split_index=train_test_split_index)
+                src = block(src, train_test_split_index=train_test_split_index, 
+                           save_peak_mem_factor=save_peak_mem_factor)
         output = src[:, train_test_split_index:, -1, :]
         output = self.decoder(output)
         return output
@@ -74,21 +88,50 @@ class FlashMultiheadAttention(nn.Module):
     """
     Drop-in replacement for nn.MultiheadAttention using scaled_dot_product_attention.
     Uses Flash Attention when available (PyTorch 2.0+, Ampere+ GPU).
+    Supports GQA (Grouped Query Attention) and batch chunking for memory efficiency.
     """
-    def __init__(self, embed_dim: int, num_heads: int, batch_first: bool = True, device=None, dtype=None):
+    def __init__(self, embed_dim: int, num_heads: int, num_kv_heads: int = None, 
+                 batch_first: bool = True, device=None, dtype=None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        assert num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+        self.num_queries_per_kv = num_heads // self.num_kv_heads
         
+        # Q projection: full number of heads
         self.q_proj = nn.Linear(embed_dim, embed_dim, device=device, dtype=dtype)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, device=device, dtype=dtype)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, device=device, dtype=dtype)
+        # K, V projections: fewer heads (GQA)
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.k_proj = nn.Linear(embed_dim, kv_dim, device=device, dtype=dtype)
+        self.v_proj = nn.Linear(embed_dim, kv_dim, device=device, dtype=dtype)
         self.out_proj = nn.Linear(embed_dim, embed_dim, device=device, dtype=dtype)
+        
+        # Check if PyTorch supports GQA
+        self.use_gqa = self._check_gqa_support()
+    
+    def _check_gqa_support(self) -> bool:
+        """Check if PyTorch supports enable_gqa parameter."""
+        if not torch.cuda.is_available():
+            return False
+        torch_version = torch.__version__.split(".")
+        torch_major, torch_minor = int(torch_version[0]), int(torch_version[1])
+        if torch_major > 2 or (torch_major == 2 and torch_minor >= 5):
+            device = torch.cuda.current_device()
+            compute_capability = torch.cuda.get_device_capability(device)
+            return compute_capability[0] >= 8  # Ampere+
+        return False
     
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
-                attn_mask: torch.Tensor = None, is_causal: bool = False) -> tuple[torch.Tensor, None]:
+                attn_mask: torch.Tensor = None, is_causal: bool = False,
+                save_peak_mem_factor: int = None) -> tuple[torch.Tensor, None]:
+        """
+        Args:
+            save_peak_mem_factor: If set, chunks along batch dimension to reduce peak memory.
+                                  Only works during inference (no gradients).
+        """
         batch_size, seq_len, _ = query.shape
         
         # Project Q, K, V
@@ -96,35 +139,75 @@ class FlashMultiheadAttention(nn.Module):
         k = self.k_proj(key)
         v = self.v_proj(value)
         
-        # Reshape for multi-head attention: (batch, seq, heads, head_dim) -> (batch, heads, seq, head_dim)
-        q = q.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H_q, L, D)
+        k = k.view(batch_size, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)    # (B, H_kv, L, D)
+        v = v.view(batch_size, -1, self.num_kv_heads, self.head_dim).transpose(1, 2)    # (B, H_kv, L, D)
+        
+        # Batch chunking: process in smaller chunks along batch dimension
+        if save_peak_mem_factor is not None and not self.training and not q.requires_grad:
+            assert save_peak_mem_factor > 1, "save_peak_mem_factor must be > 1"
+            chunk_size = (batch_size + save_peak_mem_factor - 1) // save_peak_mem_factor
+            attn_outputs = []
+            
+            for i in range(0, batch_size, chunk_size):
+                end_idx = min(i + chunk_size, batch_size)
+                q_chunk = q[i:end_idx]
+                k_chunk = k[i:end_idx]
+                v_chunk = v[i:end_idx]
+                mask_chunk = attn_mask[i:end_idx] if attn_mask is not None else None
+                
+                attn_chunk = self._compute_attention(q_chunk, k_chunk, v_chunk, mask_chunk, is_causal)
+                attn_outputs.append(attn_chunk)
+            
+            attn_output = torch.cat(attn_outputs, dim=0)
+        else:
+            attn_output = self._compute_attention(q, k, v, attn_mask, is_causal)
+        
+        # Reshape back: (batch, heads, seq, head_dim) -> (batch, seq, embed_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        
+        return self.out_proj(attn_output), None
+    
+    def _compute_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                           attn_mask: torch.Tensor = None, is_causal: bool = False) -> torch.Tensor:
+        """Core attention computation with GQA support."""
+        extra_inputs = {}
+        if self.use_gqa and self.num_kv_heads < self.num_heads:
+            # PyTorch 2.5+ GQA support
+            extra_inputs["enable_gqa"] = True
+        else:
+            # Manual broadcasting: expand K,V to match Q heads
+            if self.num_kv_heads < self.num_heads:
+                k = k.repeat_interleave(self.num_queries_per_kv, dim=1)
+                v = v.repeat_interleave(self.num_queries_per_kv, dim=1)
         
         # Flash Attention via scaled_dot_product_attention
-        # Automatically uses flash attention if available, else memory-efficient, else math
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
             is_causal=is_causal,
-            scale=1.0 / (self.head_dim ** 0.5)
+            scale=1.0 / (self.head_dim ** 0.5),
+            **extra_inputs
         )
         
-        # Reshape back: (batch, heads, seq, head_dim) -> (batch, seq, embed_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.embed_dim)
-        
-        return self.out_proj(attn_output), None
+        return attn_output
 
 
 class TransformerEncoderLayerOptimized(nn.Module):
     """
     Transformer layer using Flash Attention for O(n) memory.
+    Supports GQA and batch chunking.
     """
     def __init__(self, embedding_size: int, nhead: int, mlp_hidden_size: int,
-                 layer_norm_eps: float = 1e-5, device=None, dtype=None):
+                 layer_norm_eps: float = 1e-5, num_kv_heads: int = None, device=None, dtype=None):
         super().__init__()
-        self.self_attention_between_datapoints = FlashMultiheadAttention(embedding_size, nhead, device=device, dtype=dtype)
-        self.self_attention_between_features = FlashMultiheadAttention(embedding_size, nhead, device=device, dtype=dtype)
+        self.self_attention_between_datapoints = FlashMultiheadAttention(
+            embedding_size, nhead, num_kv_heads=num_kv_heads, device=device, dtype=dtype
+        )
+        self.self_attention_between_features = FlashMultiheadAttention(
+            embedding_size, nhead, num_kv_heads=num_kv_heads, device=device, dtype=dtype
+        )
         
         self.linear1 = nn.Linear(embedding_size, mlp_hidden_size, device=device, dtype=dtype)
         self.linear2 = nn.Linear(mlp_hidden_size, embedding_size, device=device, dtype=dtype)
@@ -133,12 +216,15 @@ class TransformerEncoderLayerOptimized(nn.Module):
         self.norm2 = nn.LayerNorm(embedding_size, eps=layer_norm_eps, device=device, dtype=dtype)
         self.norm3 = nn.LayerNorm(embedding_size, eps=layer_norm_eps, device=device, dtype=dtype)
 
-    def forward(self, src: torch.Tensor, train_test_split_index: int) -> torch.Tensor:
+    def forward(self, src: torch.Tensor, train_test_split_index: int,
+                save_peak_mem_factor: int = None) -> torch.Tensor:
         batch_size, rows_size, col_size, embedding_size = src.shape
         
         # Attention between features
         src = src.reshape(batch_size * rows_size, col_size, embedding_size)
-        src = self.self_attention_between_features(src, src, src)[0] + src
+        src = self.self_attention_between_features(
+            src, src, src, save_peak_mem_factor=save_peak_mem_factor
+        )[0] + src
         src = src.reshape(batch_size, rows_size, col_size, embedding_size)
         src = self.norm1(src)
         
@@ -150,14 +236,16 @@ class TransformerEncoderLayerOptimized(nn.Module):
         src_left = self.self_attention_between_datapoints(
             src[:, :train_test_split_index],
             src[:, :train_test_split_index],
-            src[:, :train_test_split_index]
+            src[:, :train_test_split_index],
+            save_peak_mem_factor=save_peak_mem_factor
         )[0]
         
         # Test data attends to training data (cross-attention)
         src_right = self.self_attention_between_datapoints(
             src[:, train_test_split_index:],
             src[:, :train_test_split_index],
-            src[:, :train_test_split_index]
+            src[:, :train_test_split_index],
+            save_peak_mem_factor=save_peak_mem_factor
         )[0]
         
         src = torch.cat([src_left, src_right], dim=1) + src
