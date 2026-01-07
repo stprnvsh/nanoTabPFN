@@ -167,36 +167,24 @@ class FNO1D(nn.Module):
 
 class GINLayer(nn.Module):
     """
-    Geometric Information Network layer.
+    Geometric Information Network layer (optimized).
     
-    Key idea: Instead of attending to input tokens (transformer) or frequency modes (FNO),
-    we attend to a LEARNED set of manifold points.
-    
-    T(z) = z + sum_k alpha_k(z) * v_k
-    
-    where:
-    - {m_k} are learned manifold points
-    - alpha_k(z) = softmax(z @ W_q @ (m_k @ W_k)^T) is attention to manifold
-    - v_k are learned values at each manifold point
+    Attends to learned manifold points instead of input tokens.
     """
     def __init__(self, d_model, num_manifold_points=16, n_heads=4):
         super().__init__()
         self.d_model = d_model
         self.num_points = num_manifold_points
         self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
         
-        # Learned manifold points
+        # Learned manifold points and values
         self.manifold = nn.Parameter(torch.randn(num_manifold_points, d_model) * 0.02)
-        
-        # Learned values at manifold points
         self.values = nn.Parameter(torch.randn(num_manifold_points, d_model) * 0.02)
         
-        # Query/Key projections
+        # Simple projections
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         
-        # FFN
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
             nn.GELU(),
@@ -213,22 +201,19 @@ class GINLayer(nn.Module):
         
         x = self.norm1(x)
         
-        # Query from input: (B, S, D) -> (B, n_heads, S, head_dim)
-        Q = self.q_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        # Simple attention: Q from input, K from manifold
+        Q = self.q_proj(x)  # (B, S, D)
+        K = self.k_proj(self.manifold)  # (K, D)
         
-        # Keys from manifold: (K, D) -> (n_heads, K, head_dim)
-        K = self.k_proj(self.manifold).view(self.num_points, self.n_heads, self.head_dim).permute(1, 0, 2)
-        
-        # Attention: (B, n_heads, S, head_dim) @ (n_heads, head_dim, K) -> (B, n_heads, S, K)
-        attn = torch.einsum('bhsd,hkd->bhsk', Q, K) / math.sqrt(self.head_dim)
+        # Attention scores: (B, S, D) @ (D, K) -> (B, S, K)
+        attn = (Q @ K.T) / math.sqrt(D)
         attn = torch.softmax(attn, dim=-1)
         
-        # Store for visualization: (B, n_heads, S, K)
-        self.last_attention = attn.detach()
+        # Store for visualization (add fake head dim)
+        self.last_attention = attn.unsqueeze(1).detach()  # (B, 1, S, K)
         
-        # Gather values: (B, n_heads, S, K) @ (K, D) -> (B, S, D)
-        # Values are shared across heads
-        out = torch.einsum('bhsk,kd->bsd', attn, self.values)
+        # Gather values: (B, S, K) @ (K, D) -> (B, S, D)
+        out = attn @ self.values
         
         x = residual + out
         x = x + self.ffn(self.norm2(x))
@@ -239,11 +224,9 @@ class GIN1D(nn.Module):
     """
     Geometric Information Network for 1D PDEs.
     
-    Learns the manifold of relevant information for the PDE operator.
-    Key difference from transformers: attends to learned manifold points
-    rather than input tokens.
+    Attends to learned manifold points rather than input tokens.
     """
-    def __init__(self, d_model=64, num_manifold_points=16, n_heads=4, n_layers=1):
+    def __init__(self, d_model=64, num_manifold_points=16, n_heads=1, n_layers=1):
         super().__init__()
         self.d_model = d_model
         self.n_layers = n_layers
@@ -253,7 +236,7 @@ class GIN1D(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, 256, d_model) * 0.02)
         
         self.layers = nn.ModuleList([
-            GINLayer(d_model, num_manifold_points, n_heads) for _ in range(n_layers)
+            GINLayer(d_model, num_manifold_points) for _ in range(n_layers)
         ])
         
         self.output_proj = nn.Linear(d_model, 1)
@@ -271,27 +254,27 @@ class GIN1D(nn.Module):
         out = self.output_proj(x).squeeze(-1)
         
         if return_attention:
-            # Return attention to manifold: (n_layers, B, n_heads, S, K)
+            # Return attention to manifold: (n_layers, B, 1, S, K)
             all_attn = torch.stack([l.last_attention for l in self.layers])
             return out, all_attn
         return out
 
 
 if __name__ == "__main__":
+    x = torch.randn(4, 64)
+    
     # Test Transformer
     model1 = PDETransformer(n_layers=1)
-    x = torch.randn(4, 64)
     out, attn = model1(x, return_attention=True)
-    print(f"Transformer 1-layer: Input {x.shape}, Output {out.shape}, Attention {attn.shape}")
+    print(f"Transformer: Input {x.shape}, Output {out.shape}, Attn {attn.shape}")
     
     # Test FNO
     model2 = FNO1D(n_layers=1)
-    out, attn = model2(x, return_attention=True)
-    print(f"FNO 1-layer: Input {x.shape}, Output {out.shape}, Attention {attn.shape}")
+    out, _ = model2(x, return_attention=True)
+    print(f"FNO: Input {x.shape}, Output {out.shape}")
     
     # Test GIN
     model3 = GIN1D(n_layers=1, num_manifold_points=16)
     out, attn = model3(x, return_attention=True)
-    print(f"GIN 1-layer: Input {x.shape}, Output {out.shape}, Attention {attn.shape}")
-    print(f"  -> GIN attends to {attn.shape[-1]} manifold points")
+    print(f"GIN: Input {x.shape}, Output {out.shape}, Attn {attn.shape} (S x K manifold)")
 

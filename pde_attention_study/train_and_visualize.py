@@ -27,7 +27,7 @@ def train(pde_type='heat', n_epochs=100, lr=1e-3, n_layers=1, model_type='transf
         model = FNO1D(d_model=64, modes=16, n_layers=n_layers).to(device)
     elif model_type == 'gin':
         print(f"Model: GIN, {n_layers} layer(s), 64 dim, 16 manifold points")
-        model = GIN1D(d_model=64, num_manifold_points=16, n_heads=4, n_layers=n_layers).to(device)
+        model = GIN1D(d_model=64, num_manifold_points=16, n_layers=n_layers).to(device)
     else:
         print(f"Model: Transformer, {n_layers} layer(s), 4 heads, 64 dim")
         model = PDETransformer(d_model=64, n_heads=4, n_layers=n_layers).to(device)
