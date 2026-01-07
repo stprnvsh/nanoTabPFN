@@ -176,12 +176,14 @@ if __name__ == "__main__":
     parser.add_argument("--profile", action="store_true", help="Run with PyTorch profiler")
     parser.add_argument("--steps", type=int, default=100, help="Training steps")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--data", type=str, default="300k_150x5_2.h5", help="HDF5 data file")
     args = parser.parse_args()
 
     device = get_default_device()
     print(f"Device: {device}")
     print(f"Steps: {args.steps}")
     print(f"Batch size: {args.batch_size}")
+    print(f"Data file: {args.data}")
     
     model = NanoTabPFNModel(
         embedding_size=96,
@@ -193,7 +195,7 @@ if __name__ == "__main__":
 
     if args.profile:
         from torch.profiler import profile, ProfilerActivity
-        prior = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=args.steps, batch_size=args.batch_size, device=device)
+        prior = PriorDumpDataLoader(args.data, num_steps=args.steps, batch_size=args.batch_size, device=device)
         
         start = time.time()
         with profile(
@@ -224,7 +226,7 @@ if __name__ == "__main__":
         if device == "cuda":
             print(torch.cuda.memory_summary())
     else:
-        prior = PriorDumpDataLoader("300k_150x5_2.h5", num_steps=args.steps, batch_size=args.batch_size, device=device)
+        prior = PriorDumpDataLoader(args.data, num_steps=args.steps, batch_size=args.batch_size, device=device)
         start = time.time()
         model, history = train(model, prior, lr=4e-3, steps_per_eval=25)
         if device == "cuda":
