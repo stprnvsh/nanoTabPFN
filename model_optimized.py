@@ -109,6 +109,21 @@ class FlashMultiheadAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, kv_dim, device=device, dtype=dtype)
         self.out_proj = nn.Linear(embed_dim, embed_dim, device=device, dtype=dtype)
         
+        # Initialize to match nn.MultiheadAttention (Xavier uniform)
+        # This ensures same initialization as standard attention for fair comparison
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        if self.q_proj.bias is not None:
+            nn.init.constant_(self.q_proj.bias, 0.0)
+        if self.k_proj.bias is not None:
+            nn.init.constant_(self.k_proj.bias, 0.0)
+        if self.v_proj.bias is not None:
+            nn.init.constant_(self.v_proj.bias, 0.0)
+        if self.out_proj.bias is not None:
+            nn.init.constant_(self.out_proj.bias, 0.0)
+        
         # Check if PyTorch supports GQA
         self.use_gqa = self._check_gqa_support()
     
