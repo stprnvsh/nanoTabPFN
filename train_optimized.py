@@ -835,6 +835,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", action="store_true", help="Enable gradient checkpointing (saves memory)")
     parser.add_argument("--threaded", action="store_true", help="Use background thread for data loading (better I/O overlap)")
     parser.add_argument("--queue-size", type=int, default=8, help="Max queue size for threaded loader")
+    parser.add_argument("--num-kv-heads", type=int, default=None, help="Number of K,V heads for GQA (default: same as num_heads)")
+    parser.add_argument("--save-peak-mem-factor", type=int, default=None, help="Chunk batch dimension by this factor to reduce peak memory (inference only)")
     args = parser.parse_args()
 
     device = get_default_device()
@@ -851,6 +853,11 @@ if __name__ == "__main__":
     if args.threaded:
         print(f"Queue size: {args.queue_size}")
     print(f"Flash Attention: {args.flash}")
+    if args.flash:
+        if args.num_kv_heads:
+            print(f"GQA: {args.num_attention_heads} Q heads, {args.num_kv_heads} K,V heads")
+        if args.save_peak_mem_factor:
+            print(f"Batch chunking: factor={args.save_peak_mem_factor}")
     print(f"Gradient checkpointing: {args.checkpoint}")
     
     # Determine GDS mode
@@ -891,7 +898,8 @@ if __name__ == "__main__":
             mlp_hidden_size=192,
             num_layers=3,
             num_outputs=2,
-            use_checkpointing=args.checkpoint
+            use_checkpointing=args.checkpoint,
+            num_kv_heads=args.num_kv_heads
         )
     else:
         model = NanoTabPFNModel(
