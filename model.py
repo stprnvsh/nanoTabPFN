@@ -193,3 +193,106 @@ class NanoTabPFNClassifier():
     def predict(self, X_test: np.array) -> np.array:
         predicted_probabilities = self.predict_proba(X_test)
         return predicted_probabilities.argmax(axis=1)
+
+
+# =============================================================================
+# GIN-based NanoTabPFN
+# =============================================================================
+
+class GINEncoderLayer(nn.Module):
+    """
+    GIN layer for tabular data: attends to learned manifold points
+    instead of other datapoints/features.
+    """
+    def __init__(self, embedding_size: int, num_manifold_points: int = 16, mlp_hidden_size: int = 192):
+        super().__init__()
+        
+        # Manifold for feature attention (shared across rows)
+        self.manifold_features = nn.Parameter(torch.randn(num_manifold_points, embedding_size) * 0.02)
+        self.values_features = nn.Parameter(torch.randn(num_manifold_points, embedding_size) * 0.02)
+        
+        # Manifold for datapoint attention (shared across columns)
+        self.manifold_datapoints = nn.Parameter(torch.randn(num_manifold_points, embedding_size) * 0.02)
+        self.values_datapoints = nn.Parameter(torch.randn(num_manifold_points, embedding_size) * 0.02)
+        
+        # Projections
+        self.q_proj_feat = nn.Linear(embedding_size, embedding_size)
+        self.k_proj_feat = nn.Linear(embedding_size, embedding_size)
+        self.q_proj_data = nn.Linear(embedding_size, embedding_size)
+        self.k_proj_data = nn.Linear(embedding_size, embedding_size)
+        
+        # MLP
+        self.linear1 = nn.Linear(embedding_size, mlp_hidden_size)
+        self.linear2 = nn.Linear(mlp_hidden_size, embedding_size)
+        
+        # Norms
+        self.norm1 = LayerNorm(embedding_size)
+        self.norm2 = LayerNorm(embedding_size)
+        self.norm3 = LayerNorm(embedding_size)
+    
+    def forward(self, src: torch.Tensor, train_test_split_index: int) -> torch.Tensor:
+        batch_size, rows_size, col_size, embedding_size = src.shape
+        
+        # 1. GIN attention between features (within each row)
+        src_flat = src.reshape(batch_size * rows_size, col_size, embedding_size)
+        Q = self.q_proj_feat(src_flat)  # (B*R, C, E)
+        K = self.k_proj_feat(self.manifold_features)  # (M, E)
+        attn = torch.softmax(Q @ K.T / (embedding_size ** 0.5), dim=-1)  # (B*R, C, M)
+        out = attn @ self.values_features  # (B*R, C, E)
+        src_flat = src_flat + out
+        src = src_flat.reshape(batch_size, rows_size, col_size, embedding_size)
+        src = self.norm1(src)
+        
+        # 2. GIN attention between datapoints (within each column)
+        src = src.transpose(1, 2)  # (B, C, R, E)
+        src_flat = src.reshape(batch_size * col_size, rows_size, embedding_size)
+        
+        Q = self.q_proj_data(src_flat)  # (B*C, R, E)
+        K = self.k_proj_data(self.manifold_datapoints)  # (M, E)
+        attn = torch.softmax(Q @ K.T / (embedding_size ** 0.5), dim=-1)  # (B*C, R, M)
+        out = attn @ self.values_datapoints  # (B*C, R, E)
+        src_flat = src_flat + out
+        
+        src = src_flat.reshape(batch_size, col_size, rows_size, embedding_size)
+        src = src.transpose(2, 1)  # (B, R, C, E)
+        src = self.norm2(src)
+        
+        # 3. MLP
+        src = self.linear2(F.gelu(self.linear1(src))) + src
+        src = self.norm3(src)
+        
+        return src
+
+
+class NanoTabPFNGIN(nn.Module):
+    """
+    GIN-based NanoTabPFN: same interface as NanoTabPFNModel but uses
+    learned manifold attention instead of self-attention.
+    """
+    def __init__(self, embedding_size: int, num_manifold_points: int, mlp_hidden_size: int, 
+                 num_layers: int, num_outputs: int):
+        super().__init__()
+        self.feature_encoder = FeatureEncoder(embedding_size)
+        self.target_encoder = TargetEncoder(embedding_size)
+        self.gin_blocks = nn.ModuleList([
+            GINEncoderLayer(embedding_size, num_manifold_points, mlp_hidden_size)
+            for _ in range(num_layers)
+        ])
+        self.decoder = Decoder(embedding_size, mlp_hidden_size, num_outputs)
+
+    def forward(self, src: tuple[torch.Tensor, torch.Tensor], train_test_split_index: int) -> torch.Tensor:
+        x_src, y_src = src
+        if len(y_src.shape) < len(x_src.shape):
+            y_src = y_src.unsqueeze(-1)
+        
+        x_src = self.feature_encoder(x_src, train_test_split_index)
+        num_rows = x_src.shape[1]
+        y_src = self.target_encoder(y_src, num_rows)
+        src = torch.cat([x_src, y_src], 2)
+        
+        for block in self.gin_blocks:
+            src = block(src, train_test_split_index=train_test_split_index)
+        
+        output = src[:, train_test_split_index:, -1, :]
+        output = self.decoder(output)
+        return output
