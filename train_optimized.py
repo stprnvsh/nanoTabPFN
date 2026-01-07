@@ -11,6 +11,8 @@ Optimized training with GPU utilization improvements:
 import random
 import time
 from collections import defaultdict
+import queue
+import threading
 import h5py
 import numpy as np
 import schedulefree
@@ -380,6 +382,7 @@ def train(model: NanoTabPFNModel, prior: DataLoader,
 
             if step % steps_per_eval == steps_per_eval - 1:
                 total_loss = loss.item()
+                
                 if eval_func is not None:
                     model.eval()
                     optimizer.eval()
@@ -491,6 +494,136 @@ class PriorDumpDataLoader(DataLoader):
         
         return dict(x=x, y=y, train_test_split_index=train_test_split_index)
 
+    def __len__(self):
+        return self.num_steps
+
+
+class ThreadedPriorDumpDataLoader(DataLoader):
+    """
+    Threaded version: background thread loads data while main thread trains.
+    
+    Benefits:
+    - True overlap: h5py disk reads happen in background thread
+    - Better for slow I/O: disk reads don't block training loop
+    - Bounded memory: queue size prevents unbounded growth
+    """
+    def __init__(self, filename, num_steps=None, batch_size=32, device=None, num_prefetch=2, max_queue_size=8):
+        self.filename = filename
+        self.batch_size = batch_size
+        self.device = device if device else get_default_device()
+        self.pointer = 0
+        self.num_prefetch = num_prefetch
+        self.max_queue_size = max_queue_size
+        
+        with h5py.File(self.filename, "r") as f:
+            self.max_num_classes = f["max_num_classes"][0]
+            self.total_samples = f["X"].shape[0]
+        
+        if num_steps is None:
+            self.num_steps = self.total_samples // batch_size
+        else:
+            self.num_steps = num_steps
+        
+        print(f"ThreadedDataLoader: {self.total_samples:,} samples, {self.num_steps} steps, batch_size={batch_size}, queue_size={max_queue_size}")
+        
+        if self.device == "cuda":
+            self.transfer_stream = torch.cuda.Stream()
+    
+    def __iter__(self):
+        # Queue for batches (producer thread → main thread)
+        batch_queue = queue.Queue(maxsize=self.max_queue_size)
+        exception_queue = queue.Queue()
+        stop_event = threading.Event()
+        
+        def producer():
+            """Background thread: loads batches and puts them in queue."""
+            try:
+                with h5py.File(self.filename, "r") as f:
+                    pointer = 0
+                    for step in range(self.num_steps):
+                        if stop_event.is_set():
+                            break
+                        
+                        # Load batch (CPU work: h5py read, numpy ops)
+                        batch = self._load_batch_cpu(f, pointer)
+                        pointer += self.batch_size
+                        if pointer >= f["X"].shape[0]:
+                            pointer = 0
+                        
+                        # Transfer to GPU (async, on transfer stream)
+                        if self.device == "cuda":
+                            with torch.cuda.stream(self.transfer_stream):
+                                batch = self._cpu_to_gpu(batch)
+                            batch_queue.put(("batch", batch))
+                        else:
+                            batch = self._cpu_to_gpu(batch)
+                            batch_queue.put(("batch", batch))
+                    
+                    batch_queue.put(("done", None))
+            except Exception as e:
+                exception_queue.put(e)
+                stop_event.set()
+        
+        # Start producer thread
+        producer_thread = threading.Thread(target=producer, daemon=True)
+        producer_thread.start()
+        
+        # Main thread: consume from queue
+        try:
+            while True:
+                msg_type, batch = batch_queue.get()
+                if msg_type == "done":
+                    break
+                
+                # Sync transfer stream before yielding
+                if self.device == "cuda":
+                    torch.cuda.current_stream().wait_stream(self.transfer_stream)
+                
+                yield batch
+        finally:
+            stop_event.set()
+            # Check for exceptions
+            try:
+                exc = exception_queue.get_nowait()
+                raise exc
+            except queue.Empty:
+                pass
+    
+    def _load_batch_cpu(self, f, pointer):
+        """Load batch on CPU (runs in background thread)."""
+        end = pointer + self.batch_size
+        num_features = f["num_features"][pointer:end].max()
+        num_datapoints_batch = f["num_datapoints"][pointer:end]
+        max_seq_in_batch = int(num_datapoints_batch.max())
+        
+        x_np = f["X"][pointer:end, :max_seq_in_batch, :num_features]
+        y_np = f["y"][pointer:end, :max_seq_in_batch]
+        train_test_split_index = f["single_eval_pos"][pointer:end][0].item()
+        
+        return {
+            "x_np": x_np,
+            "y_np": y_np,
+            "train_test_split_index": train_test_split_index
+        }
+    
+    def _cpu_to_gpu(self, batch):
+        """Transfer to GPU (can run on transfer stream)."""
+        x = torch.from_numpy(batch["x_np"]).pin_memory()
+        y = torch.from_numpy(batch["y_np"]).pin_memory()
+        
+        if self.device == "cuda":
+            x = x.to(self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
+        else:
+            x = x.to(self.device)
+            y = y.to(self.device)
+        
+        return dict(
+            x=x,
+            y=y,
+            train_test_split_index=batch["train_test_split_index"]
+        )
+    
     def __len__(self):
         return self.num_steps
 
@@ -700,6 +833,8 @@ if __name__ == "__main__":
     parser.add_argument("--gds-bin", action="store_true", help="TRUE GDS with .bin (disk -> GPU, no CPU)")
     parser.add_argument("--flash", action="store_true", help="Use Flash Attention model (O(n) memory)")
     parser.add_argument("--checkpoint", action="store_true", help="Enable gradient checkpointing (saves memory)")
+    parser.add_argument("--threaded", action="store_true", help="Use background thread for data loading (better I/O overlap)")
+    parser.add_argument("--queue-size", type=int, default=8, help="Max queue size for threaded loader")
     args = parser.parse_args()
 
     device = get_default_device()
@@ -712,6 +847,9 @@ if __name__ == "__main__":
     print(f"VRAM prefetch: {args.prefetch} batches")
     print(f"Data file: {args.data}")
     print(f"GDS mode: {'bin (true GDS)' if args.gds_bin else 'npy' if args.gds else 'off'}")
+    print(f"Threaded loading: {args.threaded}")
+    if args.threaded:
+        print(f"Queue size: {args.queue_size}")
     print(f"Flash Attention: {args.flash}")
     print(f"Gradient checkpointing: {args.checkpoint}")
     
@@ -721,6 +859,29 @@ if __name__ == "__main__":
     
     # Determine num_steps
     num_steps = None if args.full else args.steps
+    
+    # Helper function to create dataloader
+    def create_dataloader(data_file, num_steps, batch_size, device):
+        """Create appropriate dataloader based on flags."""
+        if use_gds:
+            return GDSDataLoader(data_file, num_steps=num_steps, batch_size=batch_size, device=device, use_bin=use_bin)
+        elif args.threaded:
+            return ThreadedPriorDumpDataLoader(
+                data_file, 
+                num_steps=num_steps, 
+                batch_size=batch_size, 
+                device=device, 
+                num_prefetch=args.prefetch,
+                max_queue_size=args.queue_size
+            )
+        else:
+            return PriorDumpDataLoader(
+                data_file, 
+                num_steps=num_steps, 
+                batch_size=batch_size, 
+                device=device, 
+                num_prefetch=args.prefetch
+            )
     
     # Select model
     if args.flash:
@@ -756,10 +917,7 @@ if __name__ == "__main__":
         
         # Warmup
         print("\nWarming up...")
-        if use_gds:
-            warmup_prior = GDSDataLoader(args.data, num_steps=3, batch_size=args.batch_size, device=device, use_bin=use_bin)
-        else:
-            warmup_prior = PriorDumpDataLoader(args.data, num_steps=3, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        warmup_prior = create_dataloader(args.data, num_steps=3, batch_size=args.batch_size, device=device)
         train(model, warmup_prior, lr=4e-3, steps_per_eval=100)
         if device == "cuda":
             torch.cuda.synchronize()
@@ -773,10 +931,7 @@ if __name__ == "__main__":
         model_profiler = ModelProfiler(device=device)
         
         # Load data
-        if use_gds:
-            prior = GDSDataLoader(args.data, num_steps=args.steps, batch_size=args.batch_size, device=device, use_bin=use_bin)
-        else:
-            prior = PriorDumpDataLoader(args.data, num_steps=args.steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        prior = create_dataloader(args.data, num_steps=args.steps, batch_size=args.batch_size, device=device)
         
         print(f"\nProfiling {args.steps} training steps...")
         print(f"Input shape: (batch={args.batch_size}, rows=variable, cols=variable, embed=96)")
@@ -836,10 +991,7 @@ if __name__ == "__main__":
         # Warmup for torch.compile (captures compilation time separately)
         print("Warming up (includes torch.compile time if enabled)...")
         warmup_start = time.time()
-        if use_gds:
-            warmup_prior = GDSDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device, use_bin=use_bin)
-        else:
-            warmup_prior = PriorDumpDataLoader(args.data, num_steps=5, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        warmup_prior = create_dataloader(args.data, num_steps=5, batch_size=args.batch_size, device=device)
         train(model, warmup_prior, lr=4e-3, steps_per_eval=100)
         if device == "cuda":
             torch.cuda.synchronize()
@@ -847,10 +999,7 @@ if __name__ == "__main__":
         print(f"Warmup time: {warmup_time:.2f}s")
         
         print(f"\nProfiling {args.steps} steps...")
-        if use_gds:
-            prior = GDSDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, use_bin=use_bin)
-        else:
-            prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        prior = create_dataloader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device)
         profile_start = time.time()
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -883,10 +1032,7 @@ if __name__ == "__main__":
     else:
         # Timed training run
         print(f"\nTraining {args.steps} steps...")
-        if use_gds:
-            prior = GDSDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, use_bin=use_bin)
-        else:
-            prior = PriorDumpDataLoader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device, num_prefetch=args.prefetch)
+        prior = create_dataloader(args.data, num_steps=num_steps, batch_size=args.batch_size, device=device)
         
         start = time.time()
         model, history = train(model, prior, lr=4e-3, steps_per_eval=25)
